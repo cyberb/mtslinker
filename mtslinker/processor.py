@@ -5,6 +5,8 @@ import shutil
 import subprocess
 from typing import Dict, List, Tuple, Union
 
+AUDIO_MERGE_BATCH_SIZE = 8
+
 
 def _check_ffmpeg():
     """Check that ffmpeg and ffprobe are available."""
@@ -66,11 +68,26 @@ def _get_video_params(file_path: str) -> Tuple[int, int, str]:
     return 1920, 1080, 'yuv420p'
 
 
+def _run_ffmpeg(cmd: list, description: str = 'ffmpeg'):
+    """Run an ffmpeg command, logging stderr on failure."""
+    logging.debug(f'Running {description}: {" ".join(cmd[:6])}...')
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode != 0:
+        stderr = result.stderr.strip() if result.stderr else '(no stderr)'
+        logging.error(f'{description} failed (exit {result.returncode}):\n{stderr}')
+        raise subprocess.CalledProcessError(
+            result.returncode, cmd[0], result.stdout, result.stderr
+        )
+    if result.stderr and result.stderr.strip():
+        logging.debug(f'{description} stderr: {result.stderr.strip()[:500]}')
+    return result
+
+
 def _generate_black_segment(output_path: str, duration: float,
                             width: int = 1920, height: int = 1080,
                             pix_fmt: str = 'yuv420p') -> str:
     """Generate a short black video+silent audio segment with ffmpeg."""
-    subprocess.run(
+    _run_ffmpeg(
         [
             'ffmpeg', '-y', '-v', 'error',
             '-f', 'lavfi', '-i', f'color=c=black:s={width}x{height}:d={duration}:r=25',
@@ -82,7 +99,7 @@ def _generate_black_segment(output_path: str, duration: float,
             '-shortest',
             output_path,
         ],
-        capture_output=True, check=True,
+        description=f'generate black segment ({duration:.1f}s)',
     )
     return output_path
 
@@ -96,7 +113,7 @@ def _ensure_audio_stream(input_path: str, output_path: str) -> str:
     if has_audio:
         return input_path
 
-    subprocess.run(
+    _run_ffmpeg(
         [
             'ffmpeg', '-y', '-v', 'error',
             '-i', input_path,
@@ -105,7 +122,7 @@ def _ensure_audio_stream(input_path: str, output_path: str) -> str:
             '-shortest',
             output_path,
         ],
-        capture_output=True, check=True,
+        description='add silent audio stream',
     )
     return output_path
 
@@ -113,7 +130,7 @@ def _ensure_audio_stream(input_path: str, output_path: str) -> str:
 def _normalize_segment(input_path: str, output_path: str,
                        width: int, height: int, pix_fmt: str) -> str:
     """Re-encode a segment to a common format for reliable concatenation."""
-    subprocess.run(
+    _run_ffmpeg(
         [
             'ffmpeg', '-y', '-v', 'error',
             '-i', input_path,
@@ -126,7 +143,7 @@ def _normalize_segment(input_path: str, output_path: str,
             '-r', '25',
             output_path,
         ],
-        capture_output=True, check=True,
+        description=f'normalize segment {os.path.basename(input_path)}',
     )
     return output_path
 
@@ -169,7 +186,7 @@ def compile_final_video(
       2. Normalize video segments to a common resolution.
       3. Generate black gap segments where needed.
       4. Concatenate with ffmpeg concat demuxer (-c copy).
-      5. Merge audio-only tracks on top.
+      5. Merge audio-only tracks on top (in batches to avoid OOM).
     """
     _check_ffmpeg()
 
@@ -251,12 +268,14 @@ def compile_final_video(
         concat_cmd.extend(['-t', str(max_duration)])
 
     concat_cmd.append(video_only_path)
-    subprocess.run(concat_cmd, check=True)
+    _run_ffmpeg(concat_cmd, description=f'concat {len(concat_segments)} segments')
 
     # If there are audio-only tracks, overlay them
     if audio_files:
         logging.info(f'Merging {len(audio_files)} audio-only tracks...')
-        result_path = _merge_audio_tracks(video_only_path, audio_files, tmp_dir, output_path)
+        result_path = _merge_audio_tracks(
+            video_only_path, audio_files, tmp_dir, output_path
+        )
     else:
         # Just move/copy the result
         shutil.move(video_only_path, output_path)
@@ -273,36 +292,121 @@ def _merge_audio_tracks(
     tmp_dir: str,
     output_path: str,
 ) -> str:
-    """Merge audio-only tracks on top of the concatenated video using ffmpeg."""
-    # Build a complex filter to mix audio tracks with delays
-    inputs = ['-i', video_path]
-    filter_parts = []
-    audio_labels = ['[0:a]']  # existing audio from video
+    """Merge audio-only tracks on top of the concatenated video.
 
+    To avoid OOM from passing dozens of inputs to a single ffmpeg amix,
+    we pre-mix all audio tracks into one WAV in batches, then overlay
+    that single track onto the video.
+
+    Strategy:
+      1. Each audio file is individually converted to a delayed WAV
+         (silence-padded to its start_time offset).
+      2. WAVs are mixed in batches of AUDIO_MERGE_BATCH_SIZE using amix.
+      3. Batch results are mixed together (tree reduction) until one
+         remains.
+      4. The final mixed audio is overlaid onto the video.
+    """
+    video_duration = _get_duration(video_path)
+    batch_size = AUDIO_MERGE_BATCH_SIZE
+
+    # Step 1: Convert each audio track to a delayed mono/stereo WAV.
+    # We use adelay + apad + atrim so each file is positioned at its
+    # correct offset and truncated to video duration. This way amix
+    # inputs are all the same length and ffmpeg doesn't need to buffer
+    # indefinitely.
+    delayed_paths = []
     for i, (apath, start_time) in enumerate(audio_files):
-        inputs.extend(['-i', apath])
-        input_idx = i + 1
+        delayed_path = os.path.join(tmp_dir, f'audio_delayed_{i}.wav')
         delay_ms = int(start_time * 1000)
-        filter_parts.append(
-            f'[{input_idx}:a]adelay={delay_ms}|{delay_ms}[a{input_idx}]'
+        _run_ffmpeg(
+            [
+                'ffmpeg', '-y', '-v', 'error',
+                '-i', apath,
+                '-af', (
+                    f'adelay={delay_ms}|{delay_ms},'
+                    f'apad=whole_dur={video_duration},'
+                    f'atrim=0:{video_duration},'
+                    f'asetpts=PTS-STARTPTS'
+                ),
+                '-ar', '44100', '-ac', '2',
+                delayed_path,
+            ],
+            description=f'delay audio track {i}/{len(audio_files)} '
+                        f'(offset {start_time:.1f}s)',
         )
-        audio_labels.append(f'[a{input_idx}]')
+        delayed_paths.append(delayed_path)
+        logging.debug(f'Prepared delayed audio {i+1}/{len(audio_files)}')
 
-    mix_filter = ';'.join(filter_parts)
-    if mix_filter:
-        mix_filter += ';'
-    mix_filter += ''.join(audio_labels) + f'amix=inputs={len(audio_labels)}:normalize=0[aout]'
+    # Step 2+3: Tree-reduce via amix in batches.
+    round_num = 0
+    current_paths = delayed_paths
+    while len(current_paths) > 1:
+        round_num += 1
+        next_paths = []
+        for batch_start in range(0, len(current_paths), batch_size):
+            batch = current_paths[batch_start:batch_start + batch_size]
+            if len(batch) == 1:
+                next_paths.append(batch[0])
+                continue
 
-    subprocess.run(
+            batch_out = os.path.join(
+                tmp_dir, f'audio_mix_r{round_num}_b{batch_start}.wav'
+            )
+            inputs = []
+            for bp in batch:
+                inputs.extend(['-i', bp])
+
+            labels = ''.join(f'[{j}:a]' for j in range(len(batch)))
+            amix_filter = (
+                f'{labels}amix=inputs={len(batch)}'
+                f':duration=longest:normalize=0'
+            )
+
+            _run_ffmpeg(
+                [
+                    'ffmpeg', '-y', '-v', 'error',
+                    *inputs,
+                    '-filter_complex', amix_filter,
+                    '-ar', '44100', '-ac', '2',
+                    batch_out,
+                ],
+                description=f'amix round {round_num}, batch {batch_start} '
+                            f'({len(batch)} tracks)',
+            )
+            next_paths.append(batch_out)
+
+            # Clean up consumed intermediate files (not the originals
+            # from round 0 — those are the delayed WAVs we still need
+            # if something goes wrong, but they're in tmp_dir anyway).
+            if round_num > 1:
+                for bp in batch:
+                    try:
+                        os.remove(bp)
+                    except OSError:
+                        pass
+
+        logging.info(
+            f'Audio mix round {round_num}: {len(current_paths)} -> '
+            f'{len(next_paths)} tracks'
+        )
+        current_paths = next_paths
+
+    mixed_audio_path = current_paths[0]
+
+    # Step 4: Overlay the single mixed audio track onto the video.
+    logging.info('Overlaying mixed audio onto video...')
+    _run_ffmpeg(
         [
             'ffmpeg', '-y', '-v', 'warning',
-            *inputs,
-            '-filter_complex', mix_filter,
+            '-i', video_path,
+            '-i', mixed_audio_path,
+            '-filter_complex',
+            '[0:a][1:a]amix=inputs=2:duration=first:normalize=0[aout]',
             '-map', '0:v', '-map', '[aout]',
             '-c:v', 'copy',
             '-c:a', 'aac', '-b:a', '192k',
             output_path,
         ],
-        check=True,
+        description='overlay mixed audio onto video',
     )
     return output_path
