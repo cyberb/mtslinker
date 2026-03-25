@@ -1,4 +1,5 @@
 import os
+import subprocess
 from typing import Dict, List, Tuple, Union
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -9,6 +10,41 @@ import logging
 TIMEOUT_SETTINGS = httpx.Timeout(None, connect=None)
 CHUNK_SIZE = 1024 * 1024  # 1 MB
 MAX_PARALLEL_DOWNLOADS = 4
+
+
+def _storage_to_hls_url(storage_url: str) -> str:
+    """Convert events-storage URL to events-delivery-records HLS URL."""
+    return (
+        storage_url
+        .replace('events-storage.webinar.ru/api-storage/files/wowza/',
+                 'events-delivery-records.webinar.ru/record/')
+        + '/playlist.m3u8'
+    )
+
+
+def _hls_has_video(hls_url: str) -> bool:
+    """Check if an HLS playlist has a video track."""
+    try:
+        with httpx.Client(timeout=httpx.Timeout(10)) as client:
+            r = client.get(hls_url, headers={'User-Agent': 'Mozilla/5.0'})
+            return 'v1/' in r.text
+    except Exception:
+        return False
+
+
+def download_hls_chunk(hls_url: str, save_path: str) -> str:
+    """Download an HLS stream to mp4 using ffmpeg."""
+    if not os.path.exists(save_path):
+        subprocess.run(
+            [
+                'ffmpeg', '-y', '-v', 'warning',
+                '-i', hls_url,
+                '-c', 'copy',
+                save_path,
+            ],
+            check=True,
+        )
+    return save_path
 
 
 def construct_json_data_url(event_session_id: str, recording_id: str) -> str:
@@ -54,6 +90,12 @@ def download_video_chunk(video_url: str, save_directory: str) -> str:
     file_path = os.path.join(save_directory, filename)
 
     if not os.path.exists(file_path):
+        # Check if HLS version has video (storage mp4 may be audio-only)
+        hls_url = _storage_to_hls_url(video_url)
+        if _hls_has_video(hls_url):
+            logging.info(f'HLS has video for {filename}, downloading via ffmpeg')
+            return download_hls_chunk(hls_url, file_path)
+
         with open(file_path, 'wb') as file:
             with httpx.Client(timeout=TIMEOUT_SETTINGS) as client:
                 with client.stream('GET', video_url) as response:
