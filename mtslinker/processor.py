@@ -172,6 +172,63 @@ def process_and_download_clips(
     return total_duration, chunks
 
 
+def _deduplicate_overlapping(
+    video_files: List[Tuple[str, float]],
+) -> List[Tuple[str, float]]:
+    """Remove overlapping video segments, keeping the longest per time window.
+
+    Recordings often have parallel streams (webcam + screen share) at the
+    same timestamp. Laying them out sequentially inflates the duration.
+    This keeps only one segment per overlapping group — the longest one —
+    so the final timeline matches real elapsed time.
+    """
+    if not video_files:
+        return video_files
+
+    # Annotate with duration
+    annotated = []  # (path, start, duration, end)
+    for path, start in video_files:
+        dur = _get_duration(path)
+        annotated.append((path, start, dur, start + dur))
+
+    # Sort by start time, then longest first so we prefer longer segments
+    annotated.sort(key=lambda x: (x[1], -x[2]))
+
+    kept = []  # (path, start, duration, end)
+    for seg in annotated:
+        path, start, dur, end = seg
+        if not kept:
+            kept.append(seg)
+            continue
+
+        _, prev_start, _, prev_end = kept[-1]
+
+        if start >= prev_end - 0.5:
+            # No meaningful overlap — keep this segment
+            kept.append(seg)
+        else:
+            # Overlaps with the previous winner — keep whichever is longer
+            if dur > kept[-1][2]:
+                logging.debug(
+                    f'Dedup: replacing {kept[-1][2]:.1f}s segment at '
+                    f'{prev_start:.1f}s with {dur:.1f}s segment at {start:.1f}s'
+                )
+                kept[-1] = seg
+            else:
+                logging.debug(
+                    f'Dedup: skipping {dur:.1f}s segment at {start:.1f}s '
+                    f'(covered by {kept[-1][2]:.1f}s segment at {prev_start:.1f}s)'
+                )
+
+    original = len(video_files)
+    deduped = len(kept)
+    if original != deduped:
+        logging.info(f'Dedup: {original} -> {deduped} segments '
+                     f'(removed {original - deduped} overlapping)')
+
+    return [(path, start) for path, start, dur, end in kept]
+
+
 def compile_final_video(
     total_duration: float,
     downloaded_files: List[Tuple[str, float]],
@@ -212,6 +269,15 @@ def compile_final_video(
 
     # Sort by start time
     video_files.sort(key=lambda x: x[1])
+
+    # Deduplicate overlapping segments: recordings often have parallel
+    # streams (webcam + screen share) running at the same time. If we
+    # concatenate them all sequentially the output is 3-4x too long.
+    # Strategy: walk through sorted segments; when a new segment starts
+    # before the current winner ends, keep whichever is longer and
+    # discard the shorter one.
+    video_files = _deduplicate_overlapping(video_files)
+    logging.info(f'After dedup: {len(video_files)} non-overlapping video segments')
 
     # Build the list of segments (normalized videos + gap fillers)
     tmp_dir = os.path.join(directory, '_tmp_ffmpeg')
@@ -274,7 +340,8 @@ def compile_final_video(
     if audio_files:
         logging.info(f'Merging {len(audio_files)} audio-only tracks...')
         result_path = _merge_audio_tracks(
-            video_only_path, audio_files, tmp_dir, output_path
+            video_only_path, audio_files, tmp_dir, output_path,
+            total_duration,
         )
     else:
         # Just move/copy the result
@@ -291,6 +358,7 @@ def _merge_audio_tracks(
     audio_files: List[Tuple[str, float]],
     tmp_dir: str,
     output_path: str,
+    total_duration: float = 0,
 ) -> str:
     """Merge audio-only tracks on top of the concatenated video.
 
@@ -306,7 +374,7 @@ def _merge_audio_tracks(
          remains.
       4. The final mixed audio is overlaid onto the video.
     """
-    video_duration = _get_duration(video_path)
+    video_duration = total_duration or _get_duration(video_path)
     batch_size = AUDIO_MERGE_BATCH_SIZE
 
     # Step 1: Convert each audio track to a delayed mono/stereo WAV.
