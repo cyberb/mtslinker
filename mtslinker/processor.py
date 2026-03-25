@@ -362,52 +362,77 @@ def _merge_audio_tracks(
 ) -> str:
     """Merge audio-only tracks on top of the concatenated video.
 
-    To avoid OOM from passing dozens of inputs to a single ffmpeg amix,
-    we pre-mix all audio tracks into one WAV in batches, then overlay
-    that single track onto the video.
+    To avoid OOM (too many ffmpeg inputs) and disk exhaustion (huge WAVs),
+    we mix audio in small batches directly with adelay inside the filter,
+    outputting compressed m4a. Each batch produces one small file, and
+    consumed intermediates are deleted immediately.
 
     Strategy:
-      1. Each audio file is individually converted to a delayed WAV
-         (silence-padded to its start_time offset).
-      2. WAVs are mixed in batches of AUDIO_MERGE_BATCH_SIZE using amix.
-      3. Batch results are mixed together (tree reduction) until one
-         remains.
-      4. The final mixed audio is overlaid onto the video.
+      1. Mix audio files in batches of AUDIO_MERGE_BATCH_SIZE, applying
+         adelay inside the filter graph (no pre-materialized delayed files).
+      2. Tree-reduce batch outputs until one mixed track remains.
+      3. Overlay the single mixed audio onto the video.
     """
     video_duration = total_duration or _get_duration(video_path)
     batch_size = AUDIO_MERGE_BATCH_SIZE
 
-    # Step 1: Convert each audio track to a delayed mono/stereo WAV.
-    # We use adelay + apad + atrim so each file is positioned at its
-    # correct offset and truncated to video duration. This way amix
-    # inputs are all the same length and ffmpeg doesn't need to buffer
-    # indefinitely.
-    delayed_paths = []
-    for i, (apath, start_time) in enumerate(audio_files):
-        delayed_path = os.path.join(tmp_dir, f'audio_delayed_{i}.wav')
-        delay_ms = int(start_time * 1000)
+    # Step 1: Mix in batches with inline adelay (no intermediate WAVs).
+    # Each batch takes up to batch_size original audio files, applies
+    # adelay per track, mixes them, and writes a compressed m4a.
+    batch_outputs = []  # (path, effective_start=0 since delay is baked in)
+    for batch_idx, batch_start in enumerate(
+        range(0, len(audio_files), batch_size)
+    ):
+        batch = audio_files[batch_start:batch_start + batch_size]
+        batch_out = os.path.join(tmp_dir, f'audio_batch_{batch_idx}.m4a')
+
+        inputs = []
+        filter_parts = []
+        mix_labels = []
+        for j, (apath, start_time) in enumerate(batch):
+            inputs.extend(['-i', apath])
+            delay_ms = int(start_time * 1000)
+            label = f'a{j}'
+            filter_parts.append(
+                f'[{j}:a]adelay={delay_ms}|{delay_ms},'
+                f'apad=whole_dur={video_duration},'
+                f'atrim=0:{video_duration},'
+                f'asetpts=PTS-STARTPTS[{label}]'
+            )
+            mix_labels.append(f'[{label}]')
+
+        if len(batch) == 1:
+            # Single track — just delay and encode, no amix needed
+            filter_graph = filter_parts[0].rsplit('[', 1)[0]  # strip label
+        else:
+            filter_graph = (
+                ';'.join(filter_parts) + ';'
+                + ''.join(mix_labels)
+                + f'amix=inputs={len(batch)}:duration=longest:normalize=0'
+            )
+
         _run_ffmpeg(
             [
                 'ffmpeg', '-y', '-v', 'error',
-                '-i', apath,
-                '-af', (
-                    f'adelay={delay_ms}|{delay_ms},'
-                    f'apad=whole_dur={video_duration},'
-                    f'atrim=0:{video_duration},'
-                    f'asetpts=PTS-STARTPTS'
-                ),
+                *inputs,
+                '-filter_complex', filter_graph,
+                '-c:a', 'aac', '-b:a', '128k',
                 '-ar', '44100', '-ac', '2',
-                delayed_path,
+                batch_out,
             ],
-            description=f'delay audio track {i}/{len(audio_files)} '
-                        f'(offset {start_time:.1f}s)',
+            description=f'amix batch {batch_idx+1} '
+                        f'({len(batch)} tracks, offset {batch[0][1]:.0f}-'
+                        f'{batch[-1][1]:.0f}s)',
         )
-        delayed_paths.append(delayed_path)
-        logging.debug(f'Prepared delayed audio {i+1}/{len(audio_files)}')
+        batch_outputs.append(batch_out)
+        logging.info(
+            f'Audio batch {batch_idx+1}/'
+            f'{(len(audio_files) + batch_size - 1) // batch_size} done'
+        )
 
-    # Step 2+3: Tree-reduce via amix in batches.
+    # Step 2: Tree-reduce batch outputs until one remains.
     round_num = 0
-    current_paths = delayed_paths
+    current_paths = batch_outputs
     while len(current_paths) > 1:
         round_num += 1
         next_paths = []
@@ -418,7 +443,7 @@ def _merge_audio_tracks(
                 continue
 
             batch_out = os.path.join(
-                tmp_dir, f'audio_mix_r{round_num}_b{batch_start}.wav'
+                tmp_dir, f'audio_reduce_r{round_num}_b{batch_start}.m4a'
             )
             inputs = []
             for bp in batch:
@@ -435,33 +460,31 @@ def _merge_audio_tracks(
                     'ffmpeg', '-y', '-v', 'error',
                     *inputs,
                     '-filter_complex', amix_filter,
+                    '-c:a', 'aac', '-b:a', '128k',
                     '-ar', '44100', '-ac', '2',
                     batch_out,
                 ],
-                description=f'amix round {round_num}, batch {batch_start} '
-                            f'({len(batch)} tracks)',
+                description=f'amix reduce round {round_num}, '
+                            f'{len(batch)} tracks',
             )
             next_paths.append(batch_out)
 
-            # Clean up consumed intermediate files (not the originals
-            # from round 0 — those are the delayed WAVs we still need
-            # if something goes wrong, but they're in tmp_dir anyway).
-            if round_num > 1:
-                for bp in batch:
-                    try:
-                        os.remove(bp)
-                    except OSError:
-                        pass
+            # Delete consumed intermediates
+            for bp in batch:
+                try:
+                    os.remove(bp)
+                except OSError:
+                    pass
 
         logging.info(
-            f'Audio mix round {round_num}: {len(current_paths)} -> '
+            f'Audio reduce round {round_num}: {len(current_paths)} -> '
             f'{len(next_paths)} tracks'
         )
         current_paths = next_paths
 
     mixed_audio_path = current_paths[0]
 
-    # Step 4: Overlay the single mixed audio track onto the video.
+    # Step 3: Overlay the single mixed audio track onto the video.
     logging.info('Overlaying mixed audio onto video...')
     _run_ffmpeg(
         [
