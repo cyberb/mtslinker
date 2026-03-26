@@ -135,6 +135,45 @@ def download_video_chunk(video_url: str, save_directory: str, max_retries: int =
     return file_path
 
 
+def download_slide_images(
+    slide_events: List[Dict],
+    save_directory: str,
+) -> List[Dict]:
+    """Download slide images and add local_path to each event.
+
+    Deduplicates by URL so each unique slide is downloaded once.
+    """
+    slides_dir = os.path.join(save_directory, 'slides')
+    os.makedirs(slides_dir, exist_ok=True)
+
+    url_to_path = {}
+    for se in slide_events:
+        url = se['slide_url']
+        if url in url_to_path:
+            continue
+        local_path = os.path.join(slides_dir, f"slide_{se['slide_number']}.jpg")
+        if not os.path.exists(local_path):
+            try:
+                with httpx.Client(timeout=httpx.Timeout(30)) as client:
+                    r = client.get(url)
+                    r.raise_for_status()
+                    with open(local_path, 'wb') as f:
+                        f.write(r.content)
+            except Exception as e:
+                logging.warning(f"Failed to download slide {se['slide_number']}: {e}")
+                continue
+        url_to_path[url] = local_path
+
+    result = []
+    for se in slide_events:
+        path = url_to_path.get(se['slide_url'])
+        if path:
+            result.append({**se, 'local_path': path})
+
+    logging.info(f'Downloaded {len(url_to_path)} unique slide images')
+    return result
+
+
 def download_chunks_parallel(
     chunks: List[Tuple[str, float]],
     save_directory: str,

@@ -163,26 +163,57 @@ def _normalize_segment(input_path: str, output_path: str,
 
 def process_and_download_clips(
     directory: str, json_data: Dict
-) -> Tuple[float, List[Tuple[str, float]]]:
-    """Extract chunk URLs and start times from the API JSON data.
+) -> Tuple[float, List[Tuple[str, float]], List[Dict]]:
+    """Extract chunk URLs, start times, and presentation slides from the API JSON.
 
     Returns:
-        (total_duration, [(url, start_time), ...])
+        (total_duration, [(url, start_time), ...], [slide_event, ...])
+
+    Each slide_event is:
+        {"time": float, "slide_number": int, "slide_url": str}
     """
     total_duration = float(json_data.get('duration', 0))
     if not total_duration:
         raise ValueError('Duration not found in JSON data.')
 
     chunks = []
+    slide_events = []
     for event in json_data.get('eventLogs', []):
-        if isinstance(event, dict):
-            data = event.get('data', {})
-            if isinstance(data, dict) and 'url' in data:
-                url = data['url']
-                start_time = event.get('relativeTime', 0)
-                chunks.append((url, start_time))
+        if not isinstance(event, dict):
+            continue
+        data = event.get('data', {})
+        if not isinstance(data, dict):
+            continue
 
-    return total_duration, chunks
+        # Media chunks (video/audio)
+        if 'url' in data:
+            chunks.append((data['url'], event.get('relativeTime', 0)))
+
+        # Presentation slide changes
+        if event.get('module') == 'presentation.update':
+            fr = data.get('fileReference', {})
+            if not isinstance(fr, dict):
+                continue
+            slide = fr.get('slide', {})
+            if not isinstance(slide, dict) or not slide.get('url'):
+                continue
+            slide_url = slide['url']
+            slide_events.append({
+                'time': event.get('relativeTime', 0),
+                'slide_number': slide.get('number', 0),
+                'slide_url': slide_url,
+            })
+
+    # Deduplicate consecutive identical slides
+    deduped_slides = []
+    for se in slide_events:
+        if not deduped_slides or se['slide_url'] != deduped_slides[-1]['slide_url']:
+            deduped_slides.append(se)
+
+    if deduped_slides:
+        logging.info(f'Found {len(deduped_slides)} presentation slide changes')
+
+    return total_duration, chunks, deduped_slides
 
 
 def _deduplicate_overlapping(
@@ -242,12 +273,126 @@ def _deduplicate_overlapping(
     return [(path, start) for path, start, dur, end in kept]
 
 
+def _composite_slides(
+    video_path: str,
+    slide_events: List[Dict],
+    output_path: str,
+    tmp_dir: str,
+    total_duration: float,
+) -> str:
+    """Composite presentation slides with webcam video.
+
+    Layout (1280x720):
+      - Left 960px: presentation slide
+      - Right 320px, top: webcam (320x180)
+      - Right 320px, below webcam: black
+    """
+    CANVAS_W, CANVAS_H = 1280, 720
+    SLIDE_W, SLIDE_H = 960, 720
+    CAM_W, CAM_H = 320, 180
+
+    logging.info(f'Compositing {len(slide_events)} slide changes onto video...')
+
+    # Step 1: Create a slide video track using concat demuxer.
+    # Each slide becomes a segment of the right duration.
+    slides_dir = os.path.join(tmp_dir, 'slide_segments')
+    os.makedirs(slides_dir, exist_ok=True)
+
+    slide_segments = []
+    for i, se in enumerate(slide_events):
+        t_start = se['time']
+        t_end = slide_events[i + 1]['time'] if i + 1 < len(slide_events) else total_duration
+        duration = t_end - t_start
+        if duration <= 0:
+            continue
+
+        seg_path = os.path.join(slides_dir, f'seg_{i}.mp4')
+        _run_ffmpeg(
+            [
+                'ffmpeg', '-y', '-v', 'error',
+                '-loop', '1', '-framerate', '1', '-t', str(duration),
+                '-i', se['local_path'],
+                '-vf', f'scale={SLIDE_W}:{SLIDE_H}:force_original_aspect_ratio=decrease,'
+                       f'pad={SLIDE_W}:{SLIDE_H}:(ow-iw)/2:(oh-ih)/2:white',
+                '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '23',
+                '-pix_fmt', 'yuv420p', '-r', '1',
+                seg_path,
+            ],
+            description=f'slide segment {i+1}/{len(slide_events)}',
+        )
+        slide_segments.append(seg_path)
+
+    # Add black leader if first slide starts after 0
+    first_time = slide_events[0]['time'] if slide_events else 0
+    if first_time > 0.5:
+        leader_path = os.path.join(slides_dir, 'leader.mp4')
+        _run_ffmpeg(
+            [
+                'ffmpeg', '-y', '-v', 'error',
+                '-f', 'lavfi', '-i',
+                f'color=c=black:s={SLIDE_W}x{SLIDE_H}:d={first_time}:r=1',
+                '-c:v', 'libx264', '-preset', 'ultrafast',
+                '-pix_fmt', 'yuv420p',
+                leader_path,
+            ],
+            description='slide leader (black)',
+        )
+        slide_segments.insert(0, leader_path)
+
+    # Concatenate slide segments into one track
+    slide_track_path = os.path.join(tmp_dir, 'slide_track.mp4')
+    concat_list = os.path.join(slides_dir, 'concat.txt')
+    with open(concat_list, 'w') as f:
+        for seg in slide_segments:
+            f.write(f"file '{os.path.abspath(seg)}'\n")
+
+    _run_ffmpeg(
+        [
+            'ffmpeg', '-y', '-v', 'error',
+            '-f', 'concat', '-safe', '0', '-i', concat_list,
+            '-c', 'copy', slide_track_path,
+        ],
+        description='concat slide track',
+    )
+    logging.info('Slide track created')
+
+    # Step 2: Combine slide track + webcam into final layout.
+    # Simple 2-input overlay: slide on left, webcam scaled to top-right.
+    filter_graph = (
+        f'[1:v]scale={CAM_W}:{CAM_H}:force_original_aspect_ratio=decrease,'
+        f'pad={CAM_W}:{CAM_H}:(ow-iw)/2:(oh-ih)/2:black[webcam];'
+        f'[0:v]pad={CANVAS_W}:{CANVAS_H}:0:0:black[padded];'
+        f'[padded][webcam]overlay={SLIDE_W}:0[out]'
+    )
+
+    cmd = [
+        'ffmpeg', '-y', '-v', 'warning',
+        '-i', slide_track_path,
+        '-i', video_path,
+        '-filter_complex', filter_graph,
+        '-map', '[out]', '-map', '1:a?',
+        '-c:v', 'libx264', '-preset', 'fast', '-crf', '23',
+        '-c:a', 'copy',
+        '-r', '25',
+        '-shortest',
+        output_path,
+    ]
+
+    _run_ffmpeg(cmd, description='composite slides + webcam')
+    logging.info('Slide compositing complete')
+
+    # Cleanup slide segments
+    shutil.rmtree(slides_dir, ignore_errors=True)
+    return output_path
+
+
 def compile_final_video(
     total_duration: float,
     downloaded_files: List[Tuple[str, float]],
     directory: str,
     output_path: str,
     max_duration: Union[int, None],
+    slide_events: List[Dict] = None,
 ):
     """Concatenate downloaded segments using ffmpeg (no MoviePy re-encoding).
 
@@ -354,6 +499,15 @@ def compile_final_video(
 
     concat_cmd.append(video_only_path)
     _run_ffmpeg(concat_cmd, description=f'concat {len(concat_segments)} segments')
+
+    # Composite slides if presentation data exists
+    if slide_events:
+        composited_path = os.path.join(tmp_dir, 'video_composited.mp4')
+        _composite_slides(
+            video_only_path, slide_events, composited_path,
+            tmp_dir, total_duration,
+        )
+        video_only_path = composited_path
 
     # If there are audio-only tracks, overlay them
     if audio_files:
