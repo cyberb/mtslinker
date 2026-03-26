@@ -18,6 +18,19 @@ def _check_ffmpeg():
             )
 
 
+def _is_valid_media(file_path: str) -> bool:
+    """Check if a media file is valid (not corrupt / has moov atom)."""
+    result = subprocess.run(
+        ['ffprobe', '-v', 'error', '-show_entries', 'format=duration',
+         '-of', 'csv=p=0', file_path],
+        capture_output=True, text=True,
+    )
+    if result.returncode != 0:
+        logging.warning(f'Corrupt/invalid file: {file_path}: {result.stderr.strip()[:200]}')
+        return False
+    return True
+
+
 def _ffprobe_streams(file_path: str) -> dict:
     """Return ffprobe stream info for a file."""
     result = subprocess.run(
@@ -249,13 +262,19 @@ def compile_final_video(
 
     video_files = []  # (path, start_time)
     audio_files = []  # (path, start_time)
+    skipped = 0
 
     for file_path, start_time in downloaded_files:
+        if not _is_valid_media(file_path):
+            skipped += 1
+            continue
         if _has_video_stream(file_path):
             video_files.append((file_path, start_time))
         else:
             audio_files.append((file_path, start_time))
 
+    if skipped:
+        logging.warning(f'Skipped {skipped} corrupt/invalid files')
     logging.info(f'Segments: {len(video_files)} video, {len(audio_files)} audio-only')
 
     if not video_files:
@@ -411,24 +430,36 @@ def _merge_audio_tracks(
                 + f'amix=inputs={len(batch)}:duration=longest:normalize=0'
             )
 
-        _run_ffmpeg(
-            [
-                'ffmpeg', '-y', '-v', 'error',
-                *inputs,
-                '-filter_complex', filter_graph,
-                '-c:a', 'aac', '-b:a', '128k',
-                '-ar', '44100', '-ac', '2',
-                batch_out,
-            ],
-            description=f'amix batch {batch_idx+1} '
-                        f'({len(batch)} tracks, offset {batch[0][1]:.0f}-'
-                        f'{batch[-1][1]:.0f}s)',
-        )
-        batch_outputs.append(batch_out)
+        try:
+            _run_ffmpeg(
+                [
+                    'ffmpeg', '-y', '-v', 'error',
+                    *inputs,
+                    '-filter_complex', filter_graph,
+                    '-c:a', 'aac', '-b:a', '128k',
+                    '-ar', '44100', '-ac', '2',
+                    batch_out,
+                ],
+                description=f'amix batch {batch_idx+1} '
+                            f'({len(batch)} tracks, offset {batch[0][1]:.0f}-'
+                            f'{batch[-1][1]:.0f}s)',
+            )
+            batch_outputs.append(batch_out)
+        except subprocess.CalledProcessError:
+            logging.warning(
+                f'Audio batch {batch_idx+1} failed, skipping '
+                f'{len(batch)} tracks'
+            )
         logging.info(
             f'Audio batch {batch_idx+1}/'
             f'{(len(audio_files) + batch_size - 1) // batch_size} done'
         )
+
+    # If no batches succeeded, skip audio overlay entirely.
+    if not batch_outputs:
+        logging.warning('All audio batches failed, skipping audio overlay')
+        shutil.move(video_path, output_path)
+        return output_path
 
     # Step 2: Tree-reduce batch outputs until one remains.
     round_num = 0

@@ -85,27 +85,53 @@ def fetch_json_data(url: str, session_id: Union[str, None]) -> Dict:
     return response.json()
 
 
-def download_video_chunk(video_url: str, save_directory: str) -> str:
+def _validate_downloaded_file(file_path: str) -> bool:
+    """Quick check that a downloaded media file is not corrupt."""
+    result = subprocess.run(
+        ['ffprobe', '-v', 'error', '-show_entries', 'format=duration',
+         '-of', 'csv=p=0', file_path],
+        capture_output=True, text=True,
+    )
+    return result.returncode == 0
+
+
+def download_video_chunk(video_url: str, save_directory: str, max_retries: int = 2) -> str:
     filename = os.path.basename(video_url)
     file_path = os.path.join(save_directory, filename)
 
-    if not os.path.exists(file_path):
+    if os.path.exists(file_path):
+        if _validate_downloaded_file(file_path):
+            return file_path
+        logging.warning(f'Existing file corrupt, re-downloading: {filename}')
+        os.remove(file_path)
+
+    for attempt in range(max_retries + 1):
         # Check if HLS version has video (storage mp4 may be audio-only)
         hls_url = _storage_to_hls_url(video_url)
         if _hls_has_video(hls_url):
             logging.info(f'HLS has video for {filename}, downloading via ffmpeg')
-            return download_hls_chunk(hls_url, file_path)
+            download_hls_chunk(hls_url, file_path)
+        else:
+            with open(file_path, 'wb') as file:
+                with httpx.Client(timeout=TIMEOUT_SETTINGS) as client:
+                    with client.stream('GET', video_url) as response:
+                        response.raise_for_status()
+                        total_size = int(response.headers.get('content-length', 0))
+                        with tqdm.tqdm(total=total_size, unit='B', unit_scale=True,
+                                       desc=f'Downloading {filename}') as progress:
+                            for chunk in response.iter_bytes(chunk_size=CHUNK_SIZE):
+                                file.write(chunk)
+                                progress.update(len(chunk))
 
-        with open(file_path, 'wb') as file:
-            with httpx.Client(timeout=TIMEOUT_SETTINGS) as client:
-                with client.stream('GET', video_url) as response:
-                    response.raise_for_status()
-                    total_size = int(response.headers.get('content-length', 0))
-                    with tqdm.tqdm(total=total_size, unit='B', unit_scale=True,
-                                   desc=f'Downloading {filename}') as progress:
-                        for chunk in response.iter_bytes(chunk_size=CHUNK_SIZE):
-                            file.write(chunk)
-                            progress.update(len(chunk))
+        if _validate_downloaded_file(file_path):
+            return file_path
+
+        if attempt < max_retries:
+            logging.warning(f'Downloaded file corrupt (attempt {attempt+1}), retrying: {filename}')
+            os.remove(file_path)
+        else:
+            logging.error(f'File still corrupt after {max_retries+1} attempts: {filename}')
+
     return file_path
 
 
