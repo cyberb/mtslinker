@@ -427,8 +427,15 @@ def compile_final_video(
         return
 
     # Determine target resolution from the first video segment
-    first_video = video_files[0][0]
-    target_w, target_h, target_pix_fmt = _get_video_params(first_video)
+    # Pick the largest resolution among video segments (some may be tiny thumbnails)
+    target_w, target_h, target_pix_fmt = 0, 0, 'yuv420p'
+    for vpath, _ in video_files:
+        w, h, pf = _get_video_params(vpath)
+        if w * h > target_w * target_h:
+            target_w, target_h, target_pix_fmt = w, h, pf
+    # Minimum 640x360 for reasonable quality
+    if target_w * target_h < 640 * 360:
+        target_w, target_h = 640, 360
     logging.info(f'Target resolution: {target_w}x{target_h}, pix_fmt={target_pix_fmt}')
 
     # Sort by start time
