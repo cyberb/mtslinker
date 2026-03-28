@@ -8,6 +8,47 @@ from typing import Dict, List, Tuple, Union
 AUDIO_MERGE_BATCH_SIZE = 8
 
 
+def _has_nvenc() -> bool:
+    """Check if NVIDIA NVENC hardware encoder is available."""
+    try:
+        result = subprocess.run(
+            ['ffmpeg', '-v', 'error', '-f', 'lavfi', '-i', 'nullsrc=s=64x64:d=0.1',
+             '-c:v', 'h264_nvenc', '-f', 'null', '-'],
+            capture_output=True, timeout=10,
+        )
+        return result.returncode == 0
+    except Exception:
+        return False
+
+
+# Detected once at import time
+_NVENC_AVAILABLE = None
+
+
+def _get_video_encoder() -> list:
+    """Return ffmpeg video encoder args, preferring NVENC if available."""
+    global _NVENC_AVAILABLE
+    if _NVENC_AVAILABLE is None:
+        _NVENC_AVAILABLE = _has_nvenc()
+        if _NVENC_AVAILABLE:
+            logging.info('NVENC GPU encoder detected, using h264_nvenc')
+        else:
+            logging.info('No NVENC, using libx264 CPU encoder')
+    if _NVENC_AVAILABLE:
+        return ['-c:v', 'h264_nvenc', '-preset', 'p4', '-cq', '23']
+    return ['-c:v', 'libx264', '-preset', 'fast', '-crf', '23']
+
+
+def _get_video_encoder_fast() -> list:
+    """Return fast encoder args for simple content (slides, gaps)."""
+    global _NVENC_AVAILABLE
+    if _NVENC_AVAILABLE is None:
+        _NVENC_AVAILABLE = _has_nvenc()
+    if _NVENC_AVAILABLE:
+        return ['-c:v', 'h264_nvenc', '-preset', 'p1', '-cq', '28']
+    return ['-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '23']
+
+
 def _check_ffmpeg():
     """Check that ffmpeg and ffprobe are available."""
     for tool in ('ffmpeg', 'ffprobe'):
@@ -106,7 +147,7 @@ def _generate_black_segment(output_path: str, duration: float,
             '-f', 'lavfi', '-i', f'color=c=black:s={width}x{height}:d={duration}:r=25',
             '-f', 'lavfi', '-i', f'anullsrc=r=44100:cl=stereo',
             '-t', str(duration),
-            '-c:v', 'libx264', '-preset', 'ultrafast', '-tune', 'stillimage',
+            *_get_video_encoder_fast(),
             '-pix_fmt', pix_fmt,
             '-c:a', 'aac', '-b:a', '128k',
             '-shortest',
@@ -151,7 +192,7 @@ def _normalize_segment(input_path: str, output_path: str,
                    f'pad={width}:{height}:(ow-iw)/2:(oh-ih)/2:black,'
                    f'setsar=1',
             '-pix_fmt', pix_fmt,
-            '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '18',
+            *_get_video_encoder_fast(),
             '-c:a', 'aac', '-b:a', '128k', '-ar', '44100', '-ac', '2',
             '-r', '25',
             output_path,
@@ -336,7 +377,7 @@ def _composite_slides(
                 '-i', se['local_path'],
                 '-vf', f'scale={SLIDE_W}:{SLIDE_H}:force_original_aspect_ratio=decrease,'
                        f'pad={SLIDE_W}:{SLIDE_H}:(ow-iw)/2:(oh-ih)/2:white',
-                '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '23',
+                *_get_video_encoder_fast(),
                 '-pix_fmt', 'yuv420p',
                 '-r', '1', '-frames:v', str(n_frames),
                 seg_path,
@@ -355,7 +396,7 @@ def _composite_slides(
                 'ffmpeg', '-y', '-v', 'error',
                 '-f', 'lavfi', '-i',
                 f'color=c=black:s={SLIDE_W}x{SLIDE_H}:d={first_time}:r=1',
-                '-c:v', 'libx264', '-preset', 'ultrafast',
+                *_get_video_encoder_fast(),
                 '-pix_fmt', 'yuv420p',
                 leader_path,
             ],
@@ -395,7 +436,7 @@ def _composite_slides(
         '-i', video_path,
         '-filter_complex', filter_graph,
         '-map', '[out]', '-map', '1:a?',
-        '-c:v', 'libx264', '-preset', 'fast', '-crf', '23',
+        *_get_video_encoder(),
         '-c:a', 'copy',
         '-r', '25',
         '-shortest',
