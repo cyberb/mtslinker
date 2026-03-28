@@ -326,18 +326,23 @@ def _composite_slides(
             continue
 
         seg_path = os.path.join(slides_dir, f'seg_{i}.mp4')
+        # Use -frames:v to strictly limit frame count at 1fps.
+        # This avoids runaway encoding for long durations.
+        n_frames = max(1, int(duration))
         _run_ffmpeg(
             [
                 'ffmpeg', '-y', '-v', 'error',
-                '-loop', '1', '-framerate', '1', '-t', str(duration),
+                '-loop', '1', '-framerate', '1',
                 '-i', se['local_path'],
                 '-vf', f'scale={SLIDE_W}:{SLIDE_H}:force_original_aspect_ratio=decrease,'
                        f'pad={SLIDE_W}:{SLIDE_H}:(ow-iw)/2:(oh-ih)/2:white',
                 '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '23',
-                '-pix_fmt', 'yuv420p', '-r', '1',
+                '-pix_fmt', 'yuv420p',
+                '-r', '1', '-frames:v', str(n_frames),
                 seg_path,
             ],
-            description=f'slide segment {i+1}/{len(slide_events)}',
+            description=f'slide segment {i+1}/{len(slide_events)} '
+                        f'({n_frames} frames, {duration:.0f}s)',
         )
         slide_segments.append(seg_path)
 
