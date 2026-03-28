@@ -175,33 +175,36 @@ def download_slide_images(
 
 
 def download_chunks_parallel(
-    chunks: List[Tuple[str, float]],
+    chunks: list,
     save_directory: str,
     max_workers: int = MAX_PARALLEL_DOWNLOADS,
-) -> List[Tuple[str, float]]:
+) -> list:
     """Download multiple chunks in parallel.
 
     Args:
-        chunks: List of (url, start_time) tuples.
+        chunks: List of (url, start_time) or (url, start_time, conf_id) tuples.
         save_directory: Directory to save files to.
         max_workers: Maximum number of parallel downloads.
 
     Returns:
-        List of (file_path, start_time) tuples in original order.
+        List of (file_path, start_time, conf_id) tuples in original order.
     """
     results = [None] * len(chunks)
 
-    def _download(index, url, start_time):
+    def _download(index, url, start_time, conf_id):
         path = download_video_chunk(url, save_directory)
-        return index, path, start_time
+        return index, path, start_time, conf_id
 
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        futures = [
-            executor.submit(_download, i, url, start_time)
-            for i, (url, start_time) in enumerate(chunks)
-        ]
+        futures = []
+        for i, chunk in enumerate(chunks):
+            url, start_time = chunk[0], chunk[1]
+            conf_id = chunk[2] if len(chunk) > 2 else None
+            futures.append(
+                executor.submit(_download, i, url, start_time, conf_id)
+            )
         for future in as_completed(futures):
-            idx, path, start_time = future.result()
-            results[idx] = (path, start_time)
+            idx, path, start_time, conf_id = future.result()
+            results[idx] = (path, start_time, conf_id)
 
     return results

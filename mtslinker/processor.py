@@ -187,7 +187,13 @@ def process_and_download_clips(
 
         # Media chunks (video/audio)
         if 'url' in data:
-            chunks.append((data['url'], event.get('relativeTime', 0)))
+            stream = data.get('stream', {})
+            conf_id = None
+            if isinstance(stream, dict):
+                conf = stream.get('conference', {})
+                if isinstance(conf, dict):
+                    conf_id = conf.get('id')
+            chunks.append((data['url'], event.get('relativeTime', 0), conf_id))
 
         # Presentation slide changes
         if event.get('module') == 'presentation.update':
@@ -217,52 +223,65 @@ def process_and_download_clips(
 
 
 def _deduplicate_overlapping(
-    video_files: List[Tuple[str, float]],
+    video_files: list,
 ) -> List[Tuple[str, float]]:
-    """Remove overlapping video segments, keeping the longest per time window.
+    """Remove overlapping video segments, keeping the best per time window.
 
-    Recordings often have parallel streams (webcam + screen share) at the
+    Recordings often have parallel streams (multiple webcams) at the
     same timestamp. Laying them out sequentially inflates the duration.
-    This keeps only one segment per overlapping group — the longest one —
-    so the final timeline matches real elapsed time.
+    This keeps only one segment per overlapping group.
+
+    Priority: prefer the conference (user) with the most total segments
+    (likely the presenter), then fall back to longest segment.
     """
     if not video_files:
         return video_files
 
-    # Annotate with duration
-    annotated = []  # (path, start, duration, end)
-    for path, start in video_files:
+    # Count segments per conf_id to identify the "main" user
+    from collections import Counter
+    conf_counts = Counter()
+    for item in video_files:
+        conf_id = item[2] if len(item) > 2 else None
+        if conf_id:
+            conf_counts[conf_id] += 1
+
+    # Annotate with duration and conf_id
+    annotated = []  # (path, start, duration, end, conf_id)
+    for item in video_files:
+        path, start = item[0], item[1]
+        conf_id = item[2] if len(item) > 2 else None
         dur = _get_duration(path)
-        annotated.append((path, start, dur, start + dur))
+        annotated.append((path, start, dur, start + dur, conf_id))
 
-    # Sort by start time, then longest first so we prefer longer segments
-    annotated.sort(key=lambda x: (x[1], -x[2]))
+    def _score(seg):
+        """Higher score = more preferred. Prefer main user, then longer."""
+        _, _, dur, _, conf_id = seg
+        conf_rank = conf_counts.get(conf_id, 0) if conf_id else 0
+        return (conf_rank, dur)
 
-    kept = []  # (path, start, duration, end)
+    # Sort by start time, then best score first
+    annotated.sort(key=lambda x: (x[1], -_score(x)[0], -_score(x)[1]))
+
+    kept = []
     for seg in annotated:
-        path, start, dur, end = seg
+        path, start, dur, end, conf_id = seg
         if not kept:
             kept.append(seg)
             continue
 
-        _, prev_start, _, prev_end = kept[-1]
+        _, prev_start, _, prev_end, _ = kept[-1]
 
         if start >= prev_end - 0.5:
-            # No meaningful overlap — keep this segment
             kept.append(seg)
         else:
-            # Overlaps with the previous winner — keep whichever is longer
-            if dur > kept[-1][2]:
+            # Overlaps — keep the one with better score
+            if _score(seg) > _score(kept[-1]):
                 logging.debug(
-                    f'Dedup: replacing {kept[-1][2]:.1f}s segment at '
-                    f'{prev_start:.1f}s with {dur:.1f}s segment at {start:.1f}s'
+                    f'Dedup: replacing {kept[-1][2]:.1f}s segment '
+                    f'(conf={kept[-1][4]}) with {dur:.1f}s segment '
+                    f'(conf={conf_id}, score={_score(seg)})'
                 )
                 kept[-1] = seg
-            else:
-                logging.debug(
-                    f'Dedup: skipping {dur:.1f}s segment at {start:.1f}s '
-                    f'(covered by {kept[-1][2]:.1f}s segment at {prev_start:.1f}s)'
-                )
 
     original = len(video_files)
     deduped = len(kept)
@@ -270,7 +289,7 @@ def _deduplicate_overlapping(
         logging.info(f'Dedup: {original} -> {deduped} segments '
                      f'(removed {original - deduped} overlapping)')
 
-    return [(path, start) for path, start, dur, end in kept]
+    return [(path, start) for path, start, dur, end, conf_id in kept]
 
 
 def _composite_slides(
@@ -405,16 +424,18 @@ def compile_final_video(
     """
     _check_ffmpeg()
 
-    video_files = []  # (path, start_time)
+    video_files = []  # (path, start_time, conf_id)
     audio_files = []  # (path, start_time)
     skipped = 0
 
-    for file_path, start_time in downloaded_files:
+    for item in downloaded_files:
+        file_path, start_time = item[0], item[1]
+        conf_id = item[2] if len(item) > 2 else None
         if not _is_valid_media(file_path):
             skipped += 1
             continue
         if _has_video_stream(file_path):
-            video_files.append((file_path, start_time))
+            video_files.append((file_path, start_time, conf_id))
         else:
             audio_files.append((file_path, start_time))
 
@@ -429,7 +450,7 @@ def compile_final_video(
     # Determine target resolution from the first video segment
     # Pick the largest resolution among video segments (some may be tiny thumbnails)
     target_w, target_h, target_pix_fmt = 0, 0, 'yuv420p'
-    for vpath, _ in video_files:
+    for vpath, *_ in video_files:
         w, h, pf = _get_video_params(vpath)
         if w * h > target_w * target_h:
             target_w, target_h, target_pix_fmt = w, h, pf
