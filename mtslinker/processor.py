@@ -21,19 +21,40 @@ def _has_nvenc() -> bool:
         return False
 
 
+def _has_cuda_overlay() -> bool:
+    """Check if ffmpeg has CUDA overlay filter support."""
+    try:
+        result = subprocess.run(
+            ['ffmpeg', '-v', 'error', '-filters'],
+            capture_output=True, text=True, timeout=10,
+        )
+        return 'overlay_cuda' in result.stdout
+    except Exception:
+        return False
+
+
 # Detected once at import time
 _NVENC_AVAILABLE = None
+_CUDA_OVERLAY_AVAILABLE = None
+
+
+def _detect_gpu():
+    """Detect GPU capabilities once."""
+    global _NVENC_AVAILABLE, _CUDA_OVERLAY_AVAILABLE
+    if _NVENC_AVAILABLE is None:
+        _NVENC_AVAILABLE = _has_nvenc()
+        _CUDA_OVERLAY_AVAILABLE = _has_cuda_overlay() if _NVENC_AVAILABLE else False
+        if _CUDA_OVERLAY_AVAILABLE:
+            logging.info('CUDA overlay + NVENC detected, using full GPU pipeline')
+        elif _NVENC_AVAILABLE:
+            logging.info('NVENC detected (no CUDA overlay), using GPU encoder only')
+        else:
+            logging.info('No GPU support, using CPU pipeline')
 
 
 def _get_video_encoder() -> list:
     """Return ffmpeg video encoder args, preferring NVENC if available."""
-    global _NVENC_AVAILABLE
-    if _NVENC_AVAILABLE is None:
-        _NVENC_AVAILABLE = _has_nvenc()
-        if _NVENC_AVAILABLE:
-            logging.info('NVENC GPU encoder detected, using h264_nvenc')
-        else:
-            logging.info('No NVENC, using libx264 CPU encoder')
+    _detect_gpu()
     if _NVENC_AVAILABLE:
         return ['-c:v', 'h264_nvenc', '-preset', 'p4', '-cq', '23']
     return ['-c:v', 'libx264', '-preset', 'fast', '-crf', '23']
@@ -422,13 +443,22 @@ def _composite_slides(
     logging.info('Slide track created')
 
     # Step 2: Combine slide track + webcam into final layout.
-    # Simple 2-input overlay: slide on left, webcam scaled to top-right.
-    filter_graph = (
-        f'[1:v]scale={CAM_W}:{CAM_H}:force_original_aspect_ratio=decrease,'
-        f'pad={CAM_W}:{CAM_H}:(ow-iw)/2:(oh-ih)/2:black[webcam];'
-        f'[0:v]pad={CANVAS_W}:{CANVAS_H}:0:0:black[padded];'
-        f'[padded][webcam]overlay={SLIDE_W}:0[out]'
-    )
+    _detect_gpu()
+    if _CUDA_OVERLAY_AVAILABLE:
+        # Full GPU pipeline: upload to CUDA, scale/pad/overlay on GPU
+        filter_graph = (
+            f'[1:v]hwupload_cuda,scale_cuda={CAM_W}:{CAM_H}[webcam_gpu];'
+            f'[0:v]hwupload_cuda,scale_cuda={CANVAS_W}:{CANVAS_H}[padded_gpu];'
+            f'[padded_gpu][webcam_gpu]overlay_cuda={SLIDE_W}:0[out]'
+        )
+    else:
+        # CPU fallback
+        filter_graph = (
+            f'[1:v]scale={CAM_W}:{CAM_H}:force_original_aspect_ratio=decrease,'
+            f'pad={CAM_W}:{CAM_H}:(ow-iw)/2:(oh-ih)/2:black[webcam];'
+            f'[0:v]pad={CANVAS_W}:{CANVAS_H}:0:0:black[padded];'
+            f'[padded][webcam]overlay={SLIDE_W}:0[out]'
+        )
 
     cmd = [
         'ffmpeg', '-y', '-v', 'warning',
