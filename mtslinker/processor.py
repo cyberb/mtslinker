@@ -488,27 +488,24 @@ def process_and_download_clips(
 def _deduplicate_overlapping(
     video_files: list,
 ) -> List[Tuple[str, float]]:
-    """Remove overlapping video segments, keeping the best per time window.
+    """Remove overlapping video segments, keeping one per time window.
 
     Recordings often have parallel streams (multiple webcams) at the
     same timestamp. Laying them out sequentially inflates the duration.
-    This keeps only one segment per overlapping group.
 
-    Priority: prefer the conference (user) with the most total segments
-    (likely the presenter), then fall back to longest segment.
+    Strategy:
+      1. Pick the "main" conference — the one with the most total recorded
+         duration (the presenter typically has a few long segments, while
+         participants toggle cameras creating many short ones).
+      2. Keep only segments from the main conference.
+      3. For time gaps where the main conference has no video, fill in
+         with the longest available segment from any other conference.
     """
     if not video_files:
         return video_files
 
-    # Count segments per conf_id to identify the "main" user
-    from collections import Counter
-    conf_counts = Counter()
-    for item in video_files:
-        conf_id = item[2] if len(item) > 2 else None
-        if conf_id:
-            conf_counts[conf_id] += 1
-
     # Annotate with duration and conf_id
+    from collections import defaultdict
     annotated = []  # (path, start, duration, end, conf_id)
     for item in video_files:
         path, start = item[0], item[1]
@@ -516,43 +513,67 @@ def _deduplicate_overlapping(
         dur = _get_duration(path)
         annotated.append((path, start, dur, start + dur, conf_id))
 
-    def _score(seg):
-        """Higher score = more preferred. Prefer main user, then longer."""
-        _, _, dur, _, conf_id = seg
-        conf_rank = conf_counts.get(conf_id, 0) if conf_id else 0
-        return (conf_rank, dur)
+    # Score each conference by total duration (not segment count)
+    conf_total_dur = defaultdict(float)
+    for _, _, dur, _, conf_id in annotated:
+        if conf_id:
+            conf_total_dur[conf_id] += dur
 
-    # Sort by start time, then best score first
-    annotated.sort(key=lambda x: (x[1], -_score(x)[0], -_score(x)[1]))
+    if conf_total_dur:
+        main_conf = max(conf_total_dur, key=conf_total_dur.get)
+        logging.info(
+            f'Dedup: main conference {main_conf} '
+            f'({conf_total_dur[main_conf]:.0f}s total from '
+            f'{sum(1 for x in annotated if x[4] == main_conf)} segments)'
+        )
+    else:
+        main_conf = None
 
+    # Separate main conference segments from others
+    main_segs = sorted(
+        [s for s in annotated if s[4] == main_conf],
+        key=lambda x: x[1],
+    )
+    other_segs = sorted(
+        [s for s in annotated if s[4] != main_conf],
+        key=lambda x: x[1],
+    )
+
+    # Build timeline from main conference segments (merge overlapping)
     kept = []
-    for seg in annotated:
-        path, start, dur, end, conf_id = seg
-        if not kept:
-            kept.append(seg)
-            continue
-
-        _, prev_start, _, prev_end, _ = kept[-1]
-
-        if start >= prev_end - 0.5:
+    for seg in main_segs:
+        if not kept or seg[1] >= kept[-1][3] - 0.5:
             kept.append(seg)
         else:
-            # Overlaps — keep the one with better score
-            if _score(seg) > _score(kept[-1]):
-                logging.debug(
-                    f'Dedup: replacing {kept[-1][2]:.1f}s segment '
-                    f'(conf={kept[-1][4]}) with {dur:.1f}s segment '
-                    f'(conf={conf_id}, score={_score(seg)})'
-                )
+            # Overlapping main segments — keep the longer one
+            if seg[2] > kept[-1][2]:
                 kept[-1] = seg
 
+    # Fill gaps with best available from other conferences
+    filled = []
+    for i, seg in enumerate(kept):
+        gap_start = kept[i - 1][3] if i > 0 else 0
+        gap_end = seg[1]
+        if gap_end - gap_start > 1.0:
+            # Find the longest other-conference segment covering this gap
+            best = None
+            for other in other_segs:
+                # Segment must overlap the gap
+                if other[3] <= gap_start or other[1] >= gap_end:
+                    continue
+                if best is None or other[2] > best[2]:
+                    best = other
+            if best:
+                filled.append(best)
+        filled.append(seg)
+
     original = len(video_files)
-    deduped = len(kept)
+    deduped = len(filled)
     if original != deduped:
         logging.info(f'Dedup: {original} -> {deduped} segments '
                      f'(removed {original - deduped} overlapping)')
 
-    return [(path, start) for path, start, dur, end, conf_id in kept]
+    return [(path, start) for path, start, dur, end, conf_id in filled]
 
 
 def _composite_slides(
