@@ -291,23 +291,16 @@ def _composite_grid(
         + f'xstack=inputs={total_cells}:layout={layout}[out]'
     )
 
-    # Mix all audio streams
-    audio_labels = ''.join(f'[{i}:a]' for i in range(n))
-    if n > 1:
-        filter_graph += f';{audio_labels}amix=inputs={n}:duration=longest:normalize=0[aout]'
-        audio_map = ['-map', '[aout]']
-    else:
-        audio_map = ['-map', '0:a?']
-
+    # Audio is handled separately by _merge_audio_tracks — output video only.
     cmd = [
         'ffmpeg', '-y', '-v', 'error',
         *inputs,
         '-t', str(duration),
         '-filter_complex', filter_graph,
-        '-map', '[out]', *audio_map,
+        '-map', '[out]',
+        '-an',
         *_get_video_encoder_fast(),
         '-pix_fmt', 'yuv420p',
-        '-c:a', 'aac', '-b:a', '128k',
         '-r', '25',
         output_path,
     ]
