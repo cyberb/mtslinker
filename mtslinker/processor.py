@@ -1,5 +1,6 @@
 import json
 import logging
+import math
 import os
 import shutil
 import subprocess
@@ -223,6 +224,213 @@ def _normalize_segment(input_path: str, output_path: str,
     return output_path
 
 
+def _compute_grid(n: int) -> Tuple[int, int]:
+    """Return (cols, rows) for a grid holding n items."""
+    cols = math.ceil(math.sqrt(n))
+    rows = math.ceil(n / cols)
+    return cols, rows
+
+
+def _composite_grid(
+    active_segments: list,
+    duration: float,
+    output_path: str,
+    target_w: int,
+    target_h: int,
+) -> str:
+    """Create a grid video from multiple simultaneous webcam segments.
+
+    Args:
+        active_segments: list of (path, offset_within_file) tuples
+        duration: length of this time window
+        output_path: where to write
+        target_w, target_h: output resolution
+    """
+    n = len(active_segments)
+    cols, rows = _compute_grid(n)
+    cell_w = target_w // cols
+    cell_h = target_h // rows
+
+    inputs = []
+    filter_parts = []
+    labels = []
+
+    for i, (path, offset) in enumerate(active_segments):
+        inputs.extend(['-ss', str(offset), '-i', path])
+        label = f'v{i}'
+        filter_parts.append(
+            f'[{i}:v]scale={cell_w}:{cell_h}:force_original_aspect_ratio=decrease,'
+            f'pad={cell_w}:{cell_h}:(ow-iw)/2:(oh-ih)/2:black,setsar=1[{label}]'
+        )
+        labels.append(f'[{label}]')
+
+    # Pad with black cells if needed
+    total_cells = cols * rows
+    for i in range(n, total_cells):
+        inputs.extend(['-f', 'lavfi', '-i',
+                       f'color=black:s={cell_w}x{cell_h}:d={duration}:r=25'])
+        label = f'v{i}'
+        labels.append(f'[{len(active_segments) + i - n}:v]')
+        # lavfi inputs don't need scaling, rename
+        idx = len(active_segments) + i - n
+        labels[-1] = f'[{idx}:v]'
+
+    # Build xstack layout string: x_y positions
+    layout_parts = []
+    for i in range(total_cells):
+        c = i % cols
+        r = i // cols
+        layout_parts.append(f'{c * cell_w}_{r * cell_h}')
+    layout = '|'.join(layout_parts)
+
+    filter_graph = ';'.join(filter_parts)
+    if filter_graph:
+        filter_graph += ';'
+    filter_graph += (
+        ''.join(labels)
+        + f'xstack=inputs={total_cells}:layout={layout}[out]'
+    )
+
+    # Mix all audio streams
+    audio_labels = ''.join(f'[{i}:a]' for i in range(n))
+    if n > 1:
+        filter_graph += f';{audio_labels}amix=inputs={n}:duration=longest:normalize=0[aout]'
+        audio_map = ['-map', '[aout]']
+    else:
+        audio_map = ['-map', '0:a?']
+
+    cmd = [
+        'ffmpeg', '-y', '-v', 'error',
+        *inputs,
+        '-t', str(duration),
+        '-filter_complex', filter_graph,
+        '-map', '[out]', *audio_map,
+        *_get_video_encoder_fast(),
+        '-pix_fmt', 'yuv420p',
+        '-c:a', 'aac', '-b:a', '128k',
+        '-r', '25',
+        output_path,
+    ]
+    _run_ffmpeg(cmd, description=f'grid {n} webcams, {duration:.0f}s')
+    return output_path
+
+
+def _build_grid_segments(
+    video_files: list,
+    tmp_dir: str,
+    target_w: int,
+    target_h: int,
+    total_duration: float,
+) -> List[Tuple[str, float]]:
+    """Build grid-composited segments from overlapping webcam streams.
+
+    Instead of deduplicating, composites all concurrent webcams into a grid.
+    Returns a list of (segment_path, start_time) ready for concatenation.
+    """
+    # Annotate with duration
+    annotated = []
+    for item in video_files:
+        path, start = item[0], item[1]
+        dur = _get_duration(path)
+        if dur > 0:
+            annotated.append((path, start, dur, start + dur))
+
+    if not annotated:
+        return []
+
+    # Collect all event times (segment starts and ends)
+    events = set()
+    for _, start, _, end in annotated:
+        events.add(start)
+        events.add(end)
+    events.add(total_duration)
+    event_times = sorted(events)
+
+    # Merge adjacent windows with the same active set
+    grid_dir = os.path.join(tmp_dir, 'grid_segments')
+    os.makedirs(grid_dir, exist_ok=True)
+
+    result = []
+    prev_active = None
+    window_start = None
+
+    for i in range(len(event_times) - 1):
+        t_start = event_times[i]
+        t_end = event_times[i + 1]
+        if t_end - t_start < 0.1:
+            continue
+
+        # Find active segments in this window
+        active = []
+        for path, seg_start, dur, seg_end in annotated:
+            if seg_start < t_end and seg_end > t_start:
+                offset = max(0, t_start - seg_start)
+                active.append((path, offset))
+
+        active_key = tuple(a[0] for a in active)
+
+        # Merge with previous window if same active set
+        if active_key == prev_active and window_start is not None:
+            continue  # will be handled when active set changes
+
+        # Emit previous merged window
+        if prev_active is not None and window_start is not None:
+            merged_end = t_start
+            merged_dur = merged_end - window_start
+            if merged_dur > 0.1:
+                _emit_grid_window(
+                    prev_active_segs, merged_dur, window_start,
+                    grid_dir, len(result), target_w, target_h, result,
+                )
+
+        window_start = t_start
+        prev_active = active_key
+        prev_active_segs = active
+
+    # Emit final window
+    if prev_active is not None and window_start is not None:
+        merged_end = event_times[-1]
+        merged_dur = merged_end - window_start
+        if merged_dur > 0.1:
+            _emit_grid_window(
+                prev_active_segs, merged_dur, window_start,
+                grid_dir, len(result), target_w, target_h, result,
+            )
+
+    logging.info(f'Grid: built {len(result)} segments from '
+                 f'{len(annotated)} webcam streams')
+    return result
+
+
+def _emit_grid_window(active, duration, start_time, grid_dir, idx,
+                      target_w, target_h, result):
+    """Helper to emit a single grid window segment."""
+    if not active:
+        return
+    seg_path = os.path.join(grid_dir, f'grid_{idx}.mp4')
+    if len(active) == 1:
+        # Single webcam — just extract the slice
+        path, offset = active[0]
+        _run_ffmpeg(
+            [
+                'ffmpeg', '-y', '-v', 'error',
+                '-ss', str(offset), '-i', path,
+                '-t', str(duration),
+                '-vf', f'scale={target_w}:{target_h}:force_original_aspect_ratio=decrease,'
+                       f'pad={target_w}:{target_h}:(ow-iw)/2:(oh-ih)/2:black,setsar=1',
+                *_get_video_encoder_fast(),
+                '-pix_fmt', 'yuv420p',
+                '-c:a', 'aac', '-b:a', '128k', '-ar', '44100', '-ac', '2',
+                '-r', '25',
+                seg_path,
+            ],
+            description=f'grid window {idx} (1 webcam, {duration:.0f}s)',
+        )
+    else:
+        _composite_grid(active, duration, seg_path, target_w, target_h)
+    result.append((seg_path, start_time))
+
+
 def process_and_download_clips(
     directory: str, json_data: Dict
 ) -> Tuple[float, List[Tuple[str, float]], List[Dict]]:
@@ -443,29 +651,30 @@ def _composite_slides(
     logging.info('Slide track created')
 
     # Step 2: Combine slide track + webcam into final layout.
+    # Webcam is input 0 (25fps, drives output frame rate).
+    # Slide track is input 1 (1fps, overlaid on left).
     _detect_gpu()
     if _CUDA_OVERLAY_AVAILABLE:
-        # Full GPU pipeline: upload to CUDA, scale/pad/overlay on GPU
         filter_graph = (
-            f'[1:v]hwupload_cuda,scale_cuda={CAM_W}:{CAM_H}[webcam_gpu];'
-            f'[0:v]hwupload_cuda,scale_cuda={CANVAS_W}:{CANVAS_H}[padded_gpu];'
-            f'[padded_gpu][webcam_gpu]overlay_cuda={SLIDE_W}:0[out]'
+            f'[0:v]hwupload_cuda,scale_cuda={CAM_W}:{CAM_H}[webcam_gpu];'
+            f'[1:v]hwupload_cuda,scale_cuda={CANVAS_W}:{CANVAS_H}[slide_gpu];'
+            f'[slide_gpu][webcam_gpu]overlay_cuda={SLIDE_W}:0[out]'
         )
     else:
-        # CPU fallback
         filter_graph = (
-            f'[1:v]scale={CAM_W}:{CAM_H}:force_original_aspect_ratio=decrease,'
-            f'pad={CAM_W}:{CAM_H}:(ow-iw)/2:(oh-ih)/2:black[webcam];'
-            f'[0:v]pad={CANVAS_W}:{CANVAS_H}:0:0:black[padded];'
-            f'[padded][webcam]overlay={SLIDE_W}:0[out]'
+            f'[0:v]scale={CAM_W}:{CAM_H}:force_original_aspect_ratio=decrease,'
+            f'pad={CANVAS_W}:{CANVAS_H}:{SLIDE_W}:0:black[base];'
+            f'[1:v]scale={SLIDE_W}:{SLIDE_H}:force_original_aspect_ratio=decrease,'
+            f'pad={SLIDE_W}:{SLIDE_H}:(ow-iw)/2:(oh-ih)/2:white[slide];'
+            f'[base][slide]overlay=0:0[out]'
         )
 
     cmd = [
         'ffmpeg', '-y', '-v', 'warning',
-        '-i', slide_track_path,
         '-i', video_path,
+        '-i', slide_track_path,
         '-filter_complex', filter_graph,
-        '-map', '[out]', '-map', '1:a?',
+        '-map', '[out]', '-map', '0:a?',
         *_get_video_encoder(),
         '-c:a', 'copy',
         '-r', '25',
@@ -538,18 +747,32 @@ def compile_final_video(
     # Sort by start time
     video_files.sort(key=lambda x: x[1])
 
-    # Deduplicate overlapping segments: recordings often have parallel
-    # streams (webcam + screen share) running at the same time. If we
-    # concatenate them all sequentially the output is 3-4x too long.
-    # Strategy: walk through sorted segments; when a new segment starts
-    # before the current winner ends, keep whichever is longer and
-    # discard the shorter one.
-    video_files = _deduplicate_overlapping(video_files)
-    logging.info(f'After dedup: {len(video_files)} non-overlapping video segments')
-
     # Build the list of segments (normalized videos + gap fillers)
     tmp_dir = os.path.join(directory, '_tmp_ffmpeg')
     os.makedirs(tmp_dir, exist_ok=True)
+
+    # Check for overlapping segments (multiple concurrent webcams)
+    has_overlaps = False
+    annotated_check = sorted(
+        [(item[0], item[1], _get_duration(item[0])) for item in video_files],
+        key=lambda x: x[1],
+    )
+    for i in range(1, len(annotated_check)):
+        prev_end = annotated_check[i-1][1] + annotated_check[i-1][2]
+        if annotated_check[i][1] < prev_end - 0.5:
+            has_overlaps = True
+            break
+
+    if has_overlaps and not slide_events:
+        # Grid layout: composite all concurrent webcams into a grid
+        logging.info('Multiple concurrent webcams detected, building grid layout')
+        video_files = _build_grid_segments(
+            video_files, tmp_dir, target_w, target_h, total_duration,
+        )
+    else:
+        # Deduplicate overlapping segments (keep presenter for slide videos)
+        video_files = _deduplicate_overlapping(video_files)
+    logging.info(f'After dedup/grid: {len(video_files)} segments')
 
     concat_segments = []
     current_time = 0.0
