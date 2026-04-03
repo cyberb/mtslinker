@@ -204,8 +204,14 @@ def _ensure_audio_stream(input_path: str, output_path: str) -> str:
 
 
 def _normalize_segment(input_path: str, output_path: str,
-                       width: int, height: int, pix_fmt: str) -> str:
-    """Re-encode a segment to a common format for reliable concatenation."""
+                       width: int, height: int, pix_fmt: str,
+                       max_duration: float = 0) -> str:
+    """Re-encode a segment to a common format for reliable concatenation.
+
+    Args:
+        max_duration: If > 0, truncate the output to this many seconds.
+    """
+    duration_args = ['-t', str(max_duration)] if max_duration > 0 else []
     _run_ffmpeg(
         [
             'ffmpeg', '-y', '-v', 'error',
@@ -217,6 +223,7 @@ def _normalize_segment(input_path: str, output_path: str,
             *_get_video_encoder_fast(),
             '-c:a', 'aac', '-b:a', '128k', '-ar', '44100', '-ac', '2',
             '-r', '25',
+            *duration_args,
             output_path,
         ],
         description=f'normalize segment {os.path.basename(input_path)}',
@@ -628,8 +635,15 @@ def _deduplicate_overlapping(
             for other in other_segs:
                 if other[3] <= gap_start or other[1] >= gap_end:
                     continue
-                if best is None or other[2] > best[2]:
-                    best = other
+                # Compute how much of this segment actually covers the gap
+                overlap_start = max(other[1], gap_start)
+                overlap_end = min(other[3], gap_end)
+                overlap_dur = overlap_end - overlap_start
+                if overlap_dur <= 0:
+                    continue
+                if best is None or overlap_dur > best[2]:
+                    best = (other[0], overlap_start, overlap_dur,
+                            overlap_end, other[4], other[5])
             if best:
                 filled.append(best)
         filled.append(seg)
@@ -658,8 +672,8 @@ def _composite_slides(
       - Right 320px, below webcam: black
     """
     CANVAS_W, CANVAS_H = 1280, 720
-    SLIDE_W, SLIDE_H = 960, 720
-    CAM_W, CAM_H = 320, 180
+    SLIDE_W, SLIDE_H = 960, CANVAS_H
+    CAM_W = CANVAS_W - SLIDE_W  # 320
 
     logging.info(f'Compositing {len(slide_events)} slide changes onto video...')
 
@@ -734,20 +748,23 @@ def _composite_slides(
     # Step 2: Combine slide track + webcam into final layout.
     # Webcam is input 0 (25fps, drives output frame rate).
     # Slide track is input 1 (1fps, overlaid on left).
+    # Determine webcam height: scale to CAM_W, keep aspect ratio,
+    # but cap at CANVAS_H so it doesn't overflow.
     _detect_gpu()
     if _CUDA_OVERLAY_AVAILABLE:
         filter_graph = (
-            f'[0:v]hwupload_cuda,scale_cuda={CAM_W}:{CAM_H}[webcam_gpu];'
+            f'[0:v]hwupload_cuda,scale_cuda={CAM_W}:-2[webcam_gpu];'
             f'[1:v]hwupload_cuda,scale_cuda={CANVAS_W}:{CANVAS_H}[slide_gpu];'
             f'[slide_gpu][webcam_gpu]overlay_cuda={SLIDE_W}:0[out]'
         )
     else:
         filter_graph = (
-            f'[0:v]scale={CAM_W}:{CAM_H}:force_original_aspect_ratio=decrease,'
-            f'pad={CANVAS_W}:{CANVAS_H}:{SLIDE_W}:0:black[base];'
-            f'[1:v]scale={SLIDE_W}:{SLIDE_H}:force_original_aspect_ratio=decrease,'
-            f'pad={SLIDE_W}:{SLIDE_H}:(ow-iw)/2:(oh-ih)/2:white[slide];'
-            f'[base][slide]overlay=0:0[out]'
+            f'[0:v]scale={CAM_W}:-2,setsar=1[webcam];'
+            f'[1:v]scale={SLIDE_W}:{CANVAS_H}:force_original_aspect_ratio=decrease,'
+            f'pad={SLIDE_W}:{CANVAS_H}:(ow-iw)/2:(oh-ih)/2:white[slide];'
+            f'color=c=black:s={CANVAS_W}x{CANVAS_H}:r=25[bg];'
+            f'[bg][slide]overlay=0:0[tmp];'
+            f'[tmp][webcam]overlay={SLIDE_W}:0[out]'
         )
 
     cmd = [
@@ -860,6 +877,14 @@ def compile_final_video(
     current_time = 0.0
 
     for i, (vpath, start_time) in enumerate(video_files):
+        # Skip segments whose start_time is before current_time (overlap)
+        if start_time < current_time - 0.5:
+            logging.warning(
+                f'Segment {i} starts at {start_time:.1f}s but current_time '
+                f'is {current_time:.1f}s — skipping overlapping segment'
+            )
+            continue
+
         # Insert black gap if needed
         gap = start_time - current_time
         if gap > 0.1:  # skip tiny gaps < 100ms
@@ -868,9 +893,22 @@ def compile_final_video(
             concat_segments.append(gap_path)
             logging.info(f'Generated {gap:.1f}s black gap before segment {i}')
 
-        # Normalize the segment
+        # Compute max allowed duration: truncate if this segment would
+        # overlap the next segment's start_time
+        max_dur = 0  # 0 = no limit
+        next_start = None
+        for j in range(i + 1, len(video_files)):
+            ns = video_files[j][1]
+            if ns > start_time + 0.5:
+                next_start = ns
+                break
+        if next_start is not None:
+            max_dur = next_start - start_time
+
+        # Normalize the segment (with optional truncation)
         norm_path = os.path.join(tmp_dir, f'norm_{i}.mp4')
-        _normalize_segment(vpath, norm_path, target_w, target_h, target_pix_fmt)
+        _normalize_segment(vpath, norm_path, target_w, target_h, target_pix_fmt,
+                           max_duration=max_dur)
         # Ensure it has an audio stream
         with_audio_path = os.path.join(tmp_dir, f'norma_{i}.mp4')
         final_seg = _ensure_audio_stream(norm_path, with_audio_path)
