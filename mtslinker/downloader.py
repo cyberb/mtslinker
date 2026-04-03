@@ -182,29 +182,30 @@ def download_chunks_parallel(
     """Download multiple chunks in parallel.
 
     Args:
-        chunks: List of (url, start_time) or (url, start_time, conf_id) tuples.
+        chunks: List of (url, start_time[, conf_id[, is_admin]]) tuples.
         save_directory: Directory to save files to.
         max_workers: Maximum number of parallel downloads.
 
     Returns:
-        List of (file_path, start_time, conf_id) tuples in original order.
+        List of (file_path, start_time, conf_id, is_admin) tuples in original order.
     """
     results = [None] * len(chunks)
 
-    def _download(index, url, start_time, conf_id):
+    def _download(index, url, start_time, conf_id, is_admin):
         path = download_video_chunk(url, save_directory)
-        return index, path, start_time, conf_id
+        return index, path, start_time, conf_id, is_admin
 
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         futures = []
         for i, chunk in enumerate(chunks):
             url, start_time = chunk[0], chunk[1]
             conf_id = chunk[2] if len(chunk) > 2 else None
+            is_admin = chunk[3] if len(chunk) > 3 else False
             futures.append(
-                executor.submit(_download, i, url, start_time, conf_id)
+                executor.submit(_download, i, url, start_time, conf_id, is_admin)
             )
         for future in as_completed(futures):
-            idx, path, start_time, conf_id = future.result()
-            results[idx] = (path, start_time, conf_id)
+            idx, path, start_time, conf_id, is_admin = future.result()
+            results[idx] = (path, start_time, conf_id, is_admin)
 
     return results

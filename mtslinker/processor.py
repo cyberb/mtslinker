@@ -424,13 +424,62 @@ def _emit_grid_window(active, duration, start_time, grid_dir, idx,
     result.append((seg_path, start_time))
 
 
+def _extract_admin_conf_ids(json_data: Dict) -> set:
+    """Find conference IDs belonging to ADMIN users.
+
+    Uses userlist events to find ADMIN user IDs, then maps them to
+    conference IDs via conference.add events.
+    """
+    admin_user_ids = set()
+    user_to_conf = {}  # user_id -> set of conf_ids
+
+    for event in json_data.get('eventLogs', []):
+        if not isinstance(event, dict):
+            continue
+        module = event.get('module', '')
+        data_list = event.get('data', [])
+        if isinstance(data_list, dict):
+            data_list = [data_list]
+        if not isinstance(data_list, list):
+            continue
+
+        for d in data_list:
+            if not isinstance(d, dict):
+                continue
+
+            if 'userlist' in module:
+                role = d.get('role', '')
+                user = d.get('user', {})
+                if isinstance(user, dict) and role == 'ADMIN':
+                    uid = user.get('id')
+                    if uid:
+                        admin_user_ids.add(uid)
+
+            if module == 'conference.add':
+                user = d.get('user', {})
+                if isinstance(user, dict):
+                    uid = user.get('id')
+                    cid = d.get('id')
+                    if uid and cid:
+                        user_to_conf.setdefault(uid, set()).add(cid)
+
+    admin_confs = set()
+    for uid in admin_user_ids:
+        admin_confs.update(user_to_conf.get(uid, set()))
+
+    if admin_confs:
+        logging.info(f'Found {len(admin_confs)} conference(s) from ADMIN users')
+
+    return admin_confs
+
+
 def process_and_download_clips(
     directory: str, json_data: Dict
 ) -> Tuple[float, List[Tuple[str, float]], List[Dict]]:
     """Extract chunk URLs, start times, and presentation slides from the API JSON.
 
     Returns:
-        (total_duration, [(url, start_time), ...], [slide_event, ...])
+        (total_duration, [(url, start_time, conf_id), ...], [slide_event, ...])
 
     Each slide_event is:
         {"time": float, "slide_number": int, "slide_url": str}
@@ -438,6 +487,8 @@ def process_and_download_clips(
     total_duration = float(json_data.get('duration', 0))
     if not total_duration:
         raise ValueError('Duration not found in JSON data.')
+
+    admin_conf_ids = _extract_admin_conf_ids(json_data)
 
     chunks = []
     slide_events = []
@@ -473,6 +524,11 @@ def process_and_download_clips(
                 'slide_url': slide_url,
             })
 
+    # Tag chunks from admin conferences for dedup priority
+    tagged_chunks = []
+    for url, start, conf_id in chunks:
+        tagged_chunks.append((url, start, conf_id, conf_id in admin_conf_ids))
+
     # Deduplicate consecutive identical slides
     deduped_slides = []
     for se in slide_events:
@@ -482,7 +538,7 @@ def process_and_download_clips(
     if deduped_slides:
         logging.info(f'Found {len(deduped_slides)} presentation slide changes')
 
-    return total_duration, chunks, deduped_slides
+    return total_duration, tagged_chunks, deduped_slides
 
 
 def _deduplicate_overlapping(
@@ -494,9 +550,8 @@ def _deduplicate_overlapping(
     same timestamp. Laying them out sequentially inflates the duration.
 
     Strategy:
-      1. Pick the "main" conference — the one with the most total recorded
-         duration (the presenter typically has a few long segments, while
-         participants toggle cameras creating many short ones).
+      1. Pick the "main" conference: prefer ADMIN user conferences,
+         then fall back to the one with the most total recorded duration.
       2. Keep only segments from the main conference.
       3. For time gaps where the main conference has no video, fill in
          with the longest available segment from any other conference.
@@ -504,22 +559,35 @@ def _deduplicate_overlapping(
     if not video_files:
         return video_files
 
-    # Annotate with duration and conf_id
+    # Annotate with duration, conf_id, and is_admin
     from collections import defaultdict
-    annotated = []  # (path, start, duration, end, conf_id)
+    annotated = []  # (path, start, duration, end, conf_id, is_admin)
     for item in video_files:
         path, start = item[0], item[1]
         conf_id = item[2] if len(item) > 2 else None
+        is_admin = item[3] if len(item) > 3 else False
         dur = _get_duration(path)
-        annotated.append((path, start, dur, start + dur, conf_id))
+        annotated.append((path, start, dur, start + dur, conf_id, is_admin))
 
-    # Score each conference by total duration (not segment count)
+    # Score each conference by total duration
     conf_total_dur = defaultdict(float)
-    for _, _, dur, _, conf_id in annotated:
+    conf_is_admin = {}
+    for _, _, dur, _, conf_id, is_admin in annotated:
         if conf_id:
             conf_total_dur[conf_id] += dur
+            if is_admin:
+                conf_is_admin[conf_id] = True
 
-    if conf_total_dur:
+    # Pick main conference: ADMIN with most duration, else any with most duration
+    admin_confs = {c for c in conf_total_dur if conf_is_admin.get(c)}
+    if admin_confs:
+        main_conf = max(admin_confs, key=conf_total_dur.get)
+        logging.info(
+            f'Dedup: main conference {main_conf} (ADMIN, '
+            f'{conf_total_dur[main_conf]:.0f}s total from '
+            f'{sum(1 for x in annotated if x[4] == main_conf)} segments)'
+        )
+    elif conf_total_dur:
         main_conf = max(conf_total_dur, key=conf_total_dur.get)
         logging.info(
             f'Dedup: main conference {main_conf} '
@@ -558,7 +626,6 @@ def _deduplicate_overlapping(
             # Find the longest other-conference segment covering this gap
             best = None
             for other in other_segs:
-                # Segment must overlap the gap
                 if other[3] <= gap_start or other[1] >= gap_end:
                     continue
                 if best is None or other[2] > best[2]:
@@ -573,7 +640,7 @@ def _deduplicate_overlapping(
         logging.info(f'Dedup: {original} -> {deduped} segments '
                      f'(removed {original - deduped} overlapping)')
 
-    return [(path, start) for path, start, dur, end, conf_id in filled]
+    return [(path, start) for path, start, dur, end, conf_id, is_admin in filled]
 
 
 def _composite_slides(
@@ -723,18 +790,19 @@ def compile_final_video(
     """
     _check_ffmpeg()
 
-    video_files = []  # (path, start_time, conf_id)
+    video_files = []  # (path, start_time, conf_id, is_admin)
     audio_files = []  # (path, start_time)
     skipped = 0
 
     for item in downloaded_files:
         file_path, start_time = item[0], item[1]
         conf_id = item[2] if len(item) > 2 else None
+        is_admin = item[3] if len(item) > 3 else False
         if not _is_valid_media(file_path):
             skipped += 1
             continue
         if _has_video_stream(file_path):
-            video_files.append((file_path, start_time, conf_id))
+            video_files.append((file_path, start_time, conf_id, is_admin))
         else:
             audio_files.append((file_path, start_time))
 
