@@ -111,6 +111,23 @@ def _ffprobe_streams(file_path: str) -> dict:
     return json.loads(result.stdout)
 
 
+def _is_silent(file_path: str, threshold: float = -80.0) -> bool:
+    """Check if an audio file is effectively silent (mean volume below threshold)."""
+    result = subprocess.run(
+        ['ffmpeg', '-v', 'error', '-i', file_path,
+         '-t', '10', '-af', 'volumedetect', '-f', 'null', '-'],
+        capture_output=True, text=True,
+    )
+    for line in result.stderr.splitlines():
+        if 'mean_volume' in line:
+            try:
+                vol = float(line.split('mean_volume:')[1].strip().split()[0])
+                return vol < threshold
+            except (ValueError, IndexError):
+                pass
+    return True  # if we can't detect, treat as silent
+
+
 def _has_video_stream(file_path: str) -> bool:
     """Check if a file contains a video stream."""
     info = _ffprobe_streams(file_path)
@@ -960,7 +977,15 @@ def compile_final_video(
         )
         video_only_path = composited_path
 
-    # If there are audio-only tracks, overlay them
+    # If there are audio-only tracks, overlay them (skip silent ones)
+    if audio_files:
+        orig_count = len(audio_files)
+        audio_files = [(p, t) for p, t in audio_files if not _is_silent(p)]
+        if orig_count != len(audio_files):
+            logging.info(
+                f'Filtered {orig_count - len(audio_files)}/{orig_count} '
+                f'silent audio-only segments'
+            )
     if audio_files:
         logging.info(f'Merging {len(audio_files)} audio-only tracks...')
         result_path = _merge_audio_tracks(
@@ -1029,13 +1054,11 @@ def _merge_audio_tracks(
             # Single track — just delay and encode, no amix needed
             filter_graph = filter_parts[0].rsplit('[', 1)[0]  # strip label
         else:
-            # amix divides volume by number of inputs — compensate with
-            # volume filter so the mix stays at original loudness
+            # normalize=0 prevents amix from dividing by N
             filter_graph = (
                 ';'.join(filter_parts) + ';'
                 + ''.join(mix_labels)
-                + f'amix=inputs={len(batch)}:duration=longest:normalize=0,'
-                + f'volume={len(batch)}'
+                + f'amix=inputs={len(batch)}:duration=longest:normalize=0'
             )
 
         try:
@@ -1091,8 +1114,7 @@ def _merge_audio_tracks(
             labels = ''.join(f'[{j}:a]' for j in range(len(batch)))
             amix_filter = (
                 f'{labels}amix=inputs={len(batch)}'
-                f':duration=longest:normalize=0,'
-                f'volume={len(batch)}'
+                f':duration=longest:normalize=0'
             )
 
             _run_ffmpeg(
@@ -1132,7 +1154,7 @@ def _merge_audio_tracks(
             '-i', video_path,
             '-i', mixed_audio_path,
             '-filter_complex',
-            '[0:a][1:a]amix=inputs=2:duration=first:normalize=0,volume=2[aout]',
+            '[0:a][1:a]amix=inputs=2:duration=first:normalize=0[aout]',
             '-map', '0:v', '-map', '[aout]',
             '-c:v', 'copy',
             '-c:a', 'aac', '-b:a', '192k',
