@@ -977,15 +977,7 @@ def compile_final_video(
         )
         video_only_path = composited_path
 
-    # If there are audio-only tracks, overlay them (skip silent ones)
-    if audio_files:
-        orig_count = len(audio_files)
-        audio_files = [(p, t) for p, t in audio_files if not _is_silent(p)]
-        if orig_count != len(audio_files):
-            logging.info(
-                f'Filtered {orig_count - len(audio_files)}/{orig_count} '
-                f'silent audio-only segments'
-            )
+    # If there are audio-only tracks, overlay them
     if audio_files:
         logging.info(f'Merging {len(audio_files)} audio-only tracks...')
         result_path = _merge_audio_tracks(
