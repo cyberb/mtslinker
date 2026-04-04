@@ -238,6 +238,11 @@ def _compute_grid(n: int) -> Tuple[int, int]:
     return cols, rows
 
 
+def _even(x: int) -> int:
+    """Round down to nearest even number (ffmpeg requires even dimensions)."""
+    return x & ~1
+
+
 def _composite_grid(
     active_segments: list,
     duration: float,
@@ -255,8 +260,8 @@ def _composite_grid(
     """
     n = len(active_segments)
     cols, rows = _compute_grid(n)
-    cell_w = target_w // cols
-    cell_h = target_h // rows
+    cell_w = _even(target_w // cols)
+    cell_h = _even(target_h // rows)
 
     inputs = []
     filter_parts = []
@@ -265,8 +270,10 @@ def _composite_grid(
     for i, (path, offset) in enumerate(active_segments):
         inputs.extend(['-ss', str(offset), '-i', path])
         label = f'v{i}'
+        # Scale to fit cell, then force exact cell dimensions with pad
         filter_parts.append(
-            f'[{i}:v]scale={cell_w}:{cell_h}:force_original_aspect_ratio=decrease,'
+            f'[{i}:v]scale=w=min({cell_w}\\,iw):h=min({cell_h}\\,ih)'
+            f':force_original_aspect_ratio=decrease,'
             f'pad={cell_w}:{cell_h}:(ow-iw)/2:(oh-ih)/2:black,setsar=1[{label}]'
         )
         labels.append(f'[{label}]')
@@ -274,13 +281,10 @@ def _composite_grid(
     # Pad with black cells if needed
     total_cells = cols * rows
     for i in range(n, total_cells):
+        idx = len(active_segments) + i - n
         inputs.extend(['-f', 'lavfi', '-i',
                        f'color=black:s={cell_w}x{cell_h}:d={duration}:r=25'])
-        label = f'v{i}'
-        labels.append(f'[{len(active_segments) + i - n}:v]')
-        # lavfi inputs don't need scaling, rename
-        idx = len(active_segments) + i - n
-        labels[-1] = f'[{idx}:v]'
+        labels.append(f'[{idx}:v]')
 
     # Build xstack layout string: x_y positions
     layout_parts = []
@@ -1025,10 +1029,13 @@ def _merge_audio_tracks(
             # Single track — just delay and encode, no amix needed
             filter_graph = filter_parts[0].rsplit('[', 1)[0]  # strip label
         else:
+            # amix divides volume by number of inputs — compensate with
+            # volume filter so the mix stays at original loudness
             filter_graph = (
                 ';'.join(filter_parts) + ';'
                 + ''.join(mix_labels)
-                + f'amix=inputs={len(batch)}:duration=longest:normalize=0'
+                + f'amix=inputs={len(batch)}:duration=longest:normalize=0,'
+                + f'volume={len(batch)}'
             )
 
         try:
@@ -1084,7 +1091,8 @@ def _merge_audio_tracks(
             labels = ''.join(f'[{j}:a]' for j in range(len(batch)))
             amix_filter = (
                 f'{labels}amix=inputs={len(batch)}'
-                f':duration=longest:normalize=0'
+                f':duration=longest:normalize=0,'
+                f'volume={len(batch)}'
             )
 
             _run_ffmpeg(
@@ -1124,7 +1132,7 @@ def _merge_audio_tracks(
             '-i', video_path,
             '-i', mixed_audio_path,
             '-filter_complex',
-            '[0:a][1:a]amix=inputs=2:duration=first:normalize=0[aout]',
+            '[0:a][1:a]amix=inputs=2:duration=first:normalize=0,volume=2[aout]',
             '-map', '0:v', '-map', '[aout]',
             '-c:v', 'copy',
             '-c:a', 'aac', '-b:a', '192k',
