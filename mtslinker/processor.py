@@ -128,6 +128,263 @@ def _is_silent(file_path: str, threshold: float = -88.0) -> bool:
     return True  # if we can't detect, treat as silent
 
 
+def _analyze_audio_levels(file_path: str, window_sec: float = 2.0,
+                          sample_rate: int = 44100) -> List[Tuple[float, float]]:
+    """Analyze RMS audio levels per time window.
+
+    Returns [(time_offset_in_file, rms_db), ...] for each window.
+    """
+    import tempfile
+    reset_samples = int(sample_rate * window_sec)
+    with tempfile.NamedTemporaryFile(suffix='.txt', delete=False) as tmp:
+        tmp_path = tmp.name
+
+    try:
+        result = subprocess.run(
+            ['ffmpeg', '-v', 'error', '-i', file_path,
+             '-af', f'astats=metadata=1:reset={reset_samples},'
+                    f'ametadata=print:key=lavfi.astats.Overall.RMS_level'
+                    f':file={tmp_path}',
+             '-f', 'null', '-'],
+            capture_output=True, text=True,
+        )
+        if result.returncode != 0:
+            return []
+
+        levels = []
+        current_time = None
+        with open(tmp_path) as f:
+            for line in f:
+                line = line.strip()
+                if line.startswith('frame:'):
+                    # Extract pts_time from "frame:N    pts:N       pts_time:N.NNN"
+                    for part in line.split():
+                        if part.startswith('pts_time:'):
+                            try:
+                                current_time = float(part.split(':')[1])
+                            except (ValueError, IndexError):
+                                pass
+                elif 'RMS_level' in line and current_time is not None:
+                    try:
+                        val = float(line.split('=')[1])
+                        levels.append((current_time, val))
+                    except (ValueError, IndexError):
+                        pass
+        return levels
+    finally:
+        try:
+            os.remove(tmp_path)
+        except OSError:
+            pass
+
+
+def _build_speaker_timeline(
+    video_files: list,
+    total_duration: float,
+    window_sec: float = 2.0,
+    silence_threshold: float = -50.0,
+    min_hold_sec: float = 4.0,
+) -> List[Tuple[float, float, str]]:
+    """Build a timeline of which conf_id should be shown at each moment.
+
+    Picks the loudest non-admin speaker when above silence_threshold,
+    otherwise defaults to admin. Applies hysteresis to prevent flickering.
+
+    Returns [(interval_start, interval_end, conf_id), ...].
+    """
+    from collections import defaultdict
+
+    if not video_files:
+        return []
+
+    # Group by conf_id, identify admin conf
+    conf_segments = defaultdict(list)  # conf_id -> [(path, start_time)]
+    admin_conf = None
+    conf_is_admin = {}
+
+    for item in video_files:
+        path, start = item[0], item[1]
+        conf_id = item[2] if len(item) > 2 else None
+        is_admin = item[3] if len(item) > 3 else False
+        if conf_id is None:
+            continue
+        conf_segments[conf_id].append((path, start))
+        if is_admin:
+            conf_is_admin[conf_id] = True
+
+    if not conf_segments:
+        return []
+
+    # Find admin conf (most duration among admin confs, or most duration overall)
+    conf_total_dur = {}
+    for conf_id, segs in conf_segments.items():
+        conf_total_dur[conf_id] = sum(_get_duration(p) for p, _ in segs)
+
+    admin_confs = {c for c in conf_segments if conf_is_admin.get(c)}
+    if admin_confs:
+        admin_conf = max(admin_confs, key=lambda c: conf_total_dur.get(c, 0))
+    elif conf_total_dur:
+        admin_conf = max(conf_total_dur, key=conf_total_dur.get)
+
+    # Analyze audio levels for each segment and map to absolute timeline
+    # conf_id -> {window_index: max_rms}
+    n_windows = int(total_duration / window_sec) + 1
+    conf_levels = defaultdict(lambda: defaultdict(lambda: -91.0))
+
+    logging.info(f'Speaker detection: analyzing audio for {len(conf_segments)} participants...')
+    for conf_id, segs in conf_segments.items():
+        for path, seg_start in segs:
+            levels = _analyze_audio_levels(path, window_sec)
+            for time_offset, rms in levels:
+                abs_time = seg_start + time_offset
+                win_idx = int(abs_time / window_sec)
+                if 0 <= win_idx < n_windows:
+                    # Keep the max RMS for this conf in this window
+                    if rms > conf_levels[conf_id][win_idx]:
+                        conf_levels[conf_id][win_idx] = rms
+
+    # For each window, pick the speaker
+    all_confs = list(conf_segments.keys())
+    non_admin = [c for c in all_confs if c != admin_conf]
+    raw_picks = []
+
+    for win_idx in range(n_windows):
+        best_non_admin = None
+        best_rms = silence_threshold
+        for conf_id in non_admin:
+            rms = conf_levels[conf_id][win_idx]
+            if rms > best_rms:
+                best_rms = rms
+                best_non_admin = conf_id
+        raw_picks.append(best_non_admin if best_non_admin else admin_conf)
+
+    # Apply hysteresis: revert short non-admin bursts to admin
+    min_hold_windows = max(1, int(min_hold_sec / window_sec))
+    picks = list(raw_picks)
+    i = 0
+    while i < len(picks):
+        if picks[i] != admin_conf:
+            # Find run length of this non-admin speaker
+            j = i
+            while j < len(picks) and picks[j] == picks[i]:
+                j += 1
+            if j - i < min_hold_windows:
+                # Too short, revert to admin
+                for k in range(i, j):
+                    picks[k] = admin_conf
+            i = j
+        else:
+            i += 1
+
+    # Merge consecutive same-speaker windows into intervals
+    intervals = []
+    if picks:
+        current_conf = picks[0]
+        interval_start = 0.0
+        for win_idx in range(1, len(picks)):
+            if picks[win_idx] != current_conf:
+                interval_end = win_idx * window_sec
+                intervals.append((interval_start, interval_end, current_conf))
+                current_conf = picks[win_idx]
+                interval_start = interval_end
+        # Final interval
+        intervals.append((interval_start, total_duration, current_conf))
+
+    # Log summary
+    non_admin_time = sum(
+        end - start for start, end, conf in intervals if conf != admin_conf
+    )
+    logging.info(
+        f'Speaker timeline: {len(intervals)} intervals, '
+        f'{non_admin_time:.0f}s non-admin out of {total_duration:.0f}s'
+    )
+
+    return intervals
+
+
+def _build_speaker_switched_segments(
+    video_files: list,
+    speaker_timeline: List[Tuple[float, float, str]],
+    tmp_dir: str,
+    target_w: int,
+    target_h: int,
+) -> List[Tuple[str, float]]:
+    """Cut webcam segments according to the speaker timeline.
+
+    For each interval, extracts the appropriate slice from the source
+    webcam segment for that conf_id. Returns [(path, start_time), ...]
+    in the same format as _deduplicate_overlapping.
+    """
+    if not speaker_timeline:
+        return []
+
+    # Build lookup: conf_id -> sorted [(path, start, duration, end)]
+    from collections import defaultdict
+    conf_segs = defaultdict(list)
+    for item in video_files:
+        path, start = item[0], item[1]
+        conf_id = item[2] if len(item) > 2 else None
+        dur = _get_duration(path)
+        conf_segs[conf_id].append((path, start, dur, start + dur))
+    for conf_id in conf_segs:
+        conf_segs[conf_id].sort(key=lambda x: x[1])
+
+    speaker_dir = os.path.join(tmp_dir, 'speaker_segments')
+    os.makedirs(speaker_dir, exist_ok=True)
+
+    result = []
+    for i, (t_start, t_end, conf_id) in enumerate(speaker_timeline):
+        duration = t_end - t_start
+        if duration < 0.1:
+            continue
+
+        # Find the source segment covering this interval
+        source = None
+        for path, seg_start, seg_dur, seg_end in conf_segs.get(conf_id, []):
+            if seg_start <= t_start + 0.5 and seg_end >= t_start + 0.5:
+                source = (path, seg_start)
+                break
+
+        if source is None:
+            # No segment for this conf_id at this time — try any conf
+            for cid, segs in conf_segs.items():
+                for path, seg_start, seg_dur, seg_end in segs:
+                    if seg_start <= t_start + 0.5 and seg_end >= t_start + 0.5:
+                        source = (path, seg_start)
+                        break
+                if source:
+                    break
+
+        if source is None:
+            continue
+
+        src_path, seg_start = source
+        offset = t_start - seg_start
+        seg_path = os.path.join(speaker_dir, f'speaker_{i:04d}.mp4')
+
+        _run_ffmpeg(
+            [
+                'ffmpeg', '-y', '-v', 'error',
+                '-ss', str(max(0, offset)),
+                '-i', src_path,
+                '-t', str(duration),
+                '-vf', f'scale={target_w}:{target_h}:force_original_aspect_ratio=decrease,'
+                       f'pad={target_w}:{target_h}:(ow-iw)/2:(oh-ih)/2:black,setsar=1',
+                *_get_video_encoder_fast(),
+                '-pix_fmt', 'yuv420p',
+                '-c:a', 'aac', '-b:a', '128k', '-ar', '44100', '-ac', '2',
+                '-r', '25',
+                seg_path,
+            ],
+            description=f'speaker segment {i+1}/{len(speaker_timeline)} '
+                        f'({duration:.0f}s, conf {conf_id})',
+        )
+        result.append((seg_path, t_start))
+
+    logging.info(f'Speaker switching: built {len(result)} segments')
+    return result
+
+
 def _has_video_stream(file_path: str) -> bool:
     """Check if a file contains a video stream."""
     info = _ffprobe_streams(file_path)
@@ -883,16 +1140,24 @@ def compile_final_video(
             has_overlaps = True
             break
 
-    if has_overlaps and not slide_events:
+    if has_overlaps and slide_events:
+        # Active speaker switching: show the talking person's webcam
+        logging.info('Multiple concurrent webcams + slides, using speaker switching')
+        speaker_timeline = _build_speaker_timeline(
+            video_files, total_duration,
+        )
+        video_files = _build_speaker_switched_segments(
+            video_files, speaker_timeline, tmp_dir, target_w, target_h,
+        )
+    elif has_overlaps:
         # Grid layout: composite all concurrent webcams into a grid
         logging.info('Multiple concurrent webcams detected, building grid layout')
         video_files = _build_grid_segments(
             video_files, tmp_dir, target_w, target_h, total_duration,
         )
     else:
-        # Deduplicate overlapping segments (keep presenter for slide videos)
         video_files = _deduplicate_overlapping(video_files)
-    logging.info(f'After dedup/grid: {len(video_files)} segments')
+    logging.info(f'After dedup/grid/speaker: {len(video_files)} segments')
 
     concat_segments = []
     current_time = 0.0
