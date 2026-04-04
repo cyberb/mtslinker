@@ -111,7 +111,7 @@ def _ffprobe_streams(file_path: str) -> dict:
     return json.loads(result.stdout)
 
 
-def _is_silent(file_path: str, threshold: float = -80.0) -> bool:
+def _is_silent(file_path: str, threshold: float = -88.0) -> bool:
     """Check if an audio file is effectively silent (mean volume below threshold)."""
     result = subprocess.run(
         ['ffmpeg', '-v', 'error', '-i', file_path,
