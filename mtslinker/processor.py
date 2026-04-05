@@ -1052,7 +1052,7 @@ def _composite_slides(
         '-filter_complex', filter_graph,
         '-map', '[out]', '-map', '0:a?',
         # Force libx264 for compositing — NVENC + long overlay OOMs on 8GB RAM
-        '-c:v', 'libx264', '-preset', 'fast', '-crf', '23',
+        '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '23',
         '-c:a', 'copy',
         '-r', '25',
         '-shortest',
@@ -1120,8 +1120,8 @@ def compile_final_video(
     # Minimum 640x360 for reasonable quality
     if target_w * target_h < 640 * 360:
         target_w, target_h = 640, 360
-    # Cap at 720p to avoid OOM on long lectures with many segments
-    MAX_H = 720
+    # Cap at 480p to avoid OOM on long lectures with many segments
+    MAX_H = 480
     if target_h > MAX_H:
         target_w = int(target_w * MAX_H / target_h)
         target_w -= target_w % 2  # keep even
