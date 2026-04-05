@@ -1051,7 +1051,8 @@ def _composite_slides(
         '-i', slide_track_path,
         '-filter_complex', filter_graph,
         '-map', '[out]', '-map', '0:a?',
-        *_get_video_encoder(),
+        # Force libx264 for compositing — NVENC + long overlay OOMs on 8GB RAM
+        '-c:v', 'libx264', '-preset', 'fast', '-crf', '23',
         '-c:a', 'copy',
         '-r', '25',
         '-shortest',
