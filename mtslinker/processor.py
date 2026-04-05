@@ -1119,6 +1119,12 @@ def compile_final_video(
     # Minimum 640x360 for reasonable quality
     if target_w * target_h < 640 * 360:
         target_w, target_h = 640, 360
+    # Cap at 720p to avoid OOM on long lectures with many segments
+    MAX_H = 720
+    if target_h > MAX_H:
+        target_w = int(target_w * MAX_H / target_h)
+        target_w -= target_w % 2  # keep even
+        target_h = MAX_H
     logging.info(f'Target resolution: {target_w}x{target_h}, pix_fmt={target_pix_fmt}')
 
     # Sort by start time
