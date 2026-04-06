@@ -1291,8 +1291,10 @@ def compile_final_video(
         '-c', 'copy',
     ]
 
-    if max_duration:
-        concat_cmd.extend(['-t', str(max_duration)])
+    # Cap at max_duration or total_duration to prevent inflated output
+    cap = max_duration or total_duration
+    if cap:
+        concat_cmd.extend(['-t', str(cap)])
 
     concat_cmd.append(video_only_path)
     _run_ffmpeg(concat_cmd, description=f'concat {len(concat_segments)} segments')
