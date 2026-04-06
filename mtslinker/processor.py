@@ -1024,10 +1024,9 @@ def _composite_slides(
     logging.info('Slide track created')
 
     # Step 2: Combine slide track + webcam into final layout.
-    # Webcam is input 0 (25fps, drives output frame rate).
-    # Slide track is input 1 (1fps, overlaid on left).
-    # Determine webcam height: scale to CAM_W, keep aspect ratio,
-    # but cap at CANVAS_H so it doesn't overflow.
+    # Process in chunks to avoid OOM on long videos.
+    CHUNK_SECS = 1800  # 30 minutes per chunk
+
     _detect_gpu()
     if _CUDA_OVERLAY_AVAILABLE:
         filter_graph = (
@@ -1045,21 +1044,68 @@ def _composite_slides(
             f'[tmp][webcam]overlay={SLIDE_W}:0[out]'
         )
 
-    cmd = [
-        'ffmpeg', '-y', '-v', 'warning',
-        '-i', video_path,
-        '-i', slide_track_path,
-        '-filter_complex', filter_graph,
-        '-map', '[out]', '-map', '0:a?',
-        # Force libx264 for compositing — NVENC + long overlay OOMs on 8GB RAM
-        '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '23',
-        '-c:a', 'copy',
-        '-r', '25',
-        '-shortest',
-        output_path,
-    ]
+    n_chunks = max(1, int(total_duration + CHUNK_SECS - 1) // CHUNK_SECS)
 
-    _run_ffmpeg(cmd, description='composite slides + webcam')
+    enc_args = _get_video_encoder()
+
+    if n_chunks == 1:
+        # Short video — composite in one pass
+        cmd = [
+            'ffmpeg', '-y', '-v', 'warning',
+            '-i', video_path,
+            '-i', slide_track_path,
+            '-filter_complex', filter_graph,
+            '-map', '[out]', '-map', '0:a?',
+            *enc_args,
+            '-c:a', 'copy',
+            '-r', '25',
+            '-shortest',
+            output_path,
+        ]
+        _run_ffmpeg(cmd, description='composite slides + webcam')
+    else:
+        # Long video — split into chunks, composite each, then concat
+        logging.info(f'Compositing in {n_chunks} chunks of {CHUNK_SECS}s to avoid OOM')
+        chunks_dir = os.path.join(tmp_dir, 'composite_chunks')
+        os.makedirs(chunks_dir, exist_ok=True)
+        chunk_paths = []
+
+        for ci in range(n_chunks):
+            ss = ci * CHUNK_SECS
+            chunk_path = os.path.join(chunks_dir, f'chunk_{ci:03d}.mp4')
+            cmd = [
+                'ffmpeg', '-y', '-v', 'warning',
+                '-ss', str(ss), '-t', str(CHUNK_SECS),
+                '-i', video_path,
+                '-ss', str(ss), '-t', str(CHUNK_SECS),
+                '-i', slide_track_path,
+                '-filter_complex', filter_graph,
+                '-map', '[out]', '-map', '0:a?',
+                *enc_args,
+                '-c:a', 'aac', '-b:a', '192k',
+                '-r', '25',
+                '-shortest',
+                chunk_path,
+            ]
+            _run_ffmpeg(cmd, description=f'composite chunk {ci+1}/{n_chunks}')
+            chunk_paths.append(chunk_path)
+            logging.info(f'Composite chunk {ci+1}/{n_chunks} done')
+
+        # Concatenate chunks
+        chunk_list = os.path.join(chunks_dir, 'concat.txt')
+        with open(chunk_list, 'w') as f:
+            for cp in chunk_paths:
+                f.write(f"file '{os.path.abspath(cp)}'\n")
+        _run_ffmpeg(
+            [
+                'ffmpeg', '-y', '-v', 'error',
+                '-f', 'concat', '-safe', '0', '-i', chunk_list,
+                '-c', 'copy', output_path,
+            ],
+            description='concat composite chunks',
+        )
+        shutil.rmtree(chunks_dir, ignore_errors=True)
+
     logging.info('Slide compositing complete')
 
     # Cleanup slide segments
@@ -1120,8 +1166,8 @@ def compile_final_video(
     # Minimum 640x360 for reasonable quality
     if target_w * target_h < 640 * 360:
         target_w, target_h = 640, 360
-    # Cap at 480p to avoid OOM on long lectures with many segments
-    MAX_H = 480
+    # Cap at 720p to avoid excessive memory use
+    MAX_H = 720
     if target_h > MAX_H:
         target_w = int(target_w * MAX_H / target_h)
         target_w -= target_w % 2  # keep even
