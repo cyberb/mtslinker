@@ -4,6 +4,7 @@ import math
 import os
 import shutil
 import subprocess
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Dict, List, Tuple, Union
 
 AUDIO_MERGE_BATCH_SIZE = 8
@@ -230,14 +231,26 @@ def _build_speaker_timeline(
     conf_levels = defaultdict(lambda: defaultdict(lambda: -91.0))
 
     logging.info(f'Speaker detection: analyzing audio for {len(conf_segments)} participants...')
+
+    # Build list of (conf_id, path, seg_start) tasks for parallel analysis
+    analysis_tasks = []
     for conf_id, segs in conf_segments.items():
         for path, seg_start in segs:
-            levels = _analyze_audio_levels(path, window_sec)
+            analysis_tasks.append((conf_id, path, seg_start))
+
+    def _analyze_task(task):
+        conf_id, path, seg_start = task
+        levels = _analyze_audio_levels(path, window_sec)
+        return conf_id, seg_start, levels
+
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        futures = {pool.submit(_analyze_task, t): t for t in analysis_tasks}
+        for fut in as_completed(futures):
+            conf_id, seg_start, levels = fut.result()
             for time_offset, rms in levels:
                 abs_time = seg_start + time_offset
                 win_idx = int(abs_time / window_sec)
                 if 0 <= win_idx < n_windows:
-                    # Keep the max RMS for this conf in this window
                     if rms > conf_levels[conf_id][win_idx]:
                         conf_levels[conf_id][win_idx] = rms
 
