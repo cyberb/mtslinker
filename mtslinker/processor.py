@@ -1264,8 +1264,16 @@ def compile_final_video(
         final_seg = _ensure_audio_stream(norm_path, with_audio_path)
         concat_segments.append(final_seg)
 
-        seg_dur = _get_duration(final_seg)
-        current_time = start_time + seg_dur
+        # Use intended duration (from timeline) to advance current_time,
+        # not actual file duration which may drift due to re-encoding.
+        if max_dur > 0:
+            current_time = start_time + max_dur
+        elif next_start is not None:
+            current_time = next_start
+        else:
+            # Last segment — use actual duration as fallback
+            seg_dur = _get_duration(final_seg)
+            current_time = start_time + seg_dur
 
     # Trailing gap
     if current_time < total_duration - 0.1:
