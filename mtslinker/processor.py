@@ -63,9 +63,7 @@ def _get_video_encoder() -> list:
 
 def _get_video_encoder_fast() -> list:
     """Return fast encoder args for simple content (slides, gaps)."""
-    global _NVENC_AVAILABLE
-    if _NVENC_AVAILABLE is None:
-        _NVENC_AVAILABLE = _has_nvenc()
+    _detect_gpu()
     if _NVENC_AVAILABLE:
         return ['-c:v', 'h264_nvenc', '-preset', 'p1', '-cq', '28']
     return ['-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '23']
