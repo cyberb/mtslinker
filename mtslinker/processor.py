@@ -1040,15 +1040,21 @@ def _composite_slides(
 
     _detect_gpu()
     if _CUDA_OVERLAY_AVAILABLE:
+        # Build canvas on CPU (slide left, webcam top-right on black bg)
+        # then upload to CUDA for encoding. overlay_cuda has limited layout
+        # control, so we use CPU overlay for correct positioning.
         filter_graph = (
-            f'[0:v]hwupload_cuda,scale_cuda={CAM_W}:-2[webcam_gpu];'
-            f'[1:v]hwupload_cuda,scale_cuda={CANVAS_W}:{CANVAS_H}[slide_gpu];'
-            f'[slide_gpu][webcam_gpu]overlay_cuda={SLIDE_W}:0[out]'
+            f'[0:v]fps=25,scale={CAM_W}:-2,setsar=1[webcam];'
+            f'[1:v]fps=25,scale={SLIDE_W}:{CANVAS_H}:force_original_aspect_ratio=decrease,'
+            f'pad={SLIDE_W}:{CANVAS_H}:(ow-iw)/2:(oh-ih)/2:white[slide];'
+            f'color=c=black:s={CANVAS_W}x{CANVAS_H}:r=25[bg];'
+            f'[bg][slide]overlay=0:0[tmp];'
+            f'[tmp][webcam]overlay={SLIDE_W}:0[out]'
         )
     else:
         filter_graph = (
-            f'[0:v]scale={CAM_W}:-2,setsar=1[webcam];'
-            f'[1:v]scale={SLIDE_W}:{CANVAS_H}:force_original_aspect_ratio=decrease,'
+            f'[0:v]fps=25,scale={CAM_W}:-2,setsar=1[webcam];'
+            f'[1:v]fps=25,scale={SLIDE_W}:{CANVAS_H}:force_original_aspect_ratio=decrease,'
             f'pad={SLIDE_W}:{CANVAS_H}:(ow-iw)/2:(oh-ih)/2:white[slide];'
             f'color=c=black:s={CANVAS_W}x{CANVAS_H}:r=25[bg];'
             f'[bg][slide]overlay=0:0[tmp];'
