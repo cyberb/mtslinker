@@ -323,15 +323,14 @@ def _build_speaker_switched_segments(
 ) -> List[Tuple[str, float]]:
     """Cut webcam segments according to the speaker timeline.
 
-    For each interval, extracts the appropriate slice from the source
-    webcam segment for that conf_id. Returns [(path, start_time), ...]
-    in the same format as _deduplicate_overlapping.
+    Layout: admin webcam always shown (top). When a non-admin speaks,
+    their webcam appears below the admin's. Admin audio is always present.
+    Returns [(path, start_time), ...] for concatenation.
     """
     if not speaker_timeline:
         return []
 
     # Build lookup: conf_id -> sorted [(path, start, duration, end)]
-    from collections import defaultdict
     conf_segs = defaultdict(list)
     for item in video_files:
         path, start = item[0], item[1]
@@ -343,6 +342,9 @@ def _build_speaker_switched_segments(
 
     speaker_dir = os.path.join(tmp_dir, 'speaker_segments')
     os.makedirs(speaker_dir, exist_ok=True)
+
+    half_h = target_h // 2
+    half_h -= half_h % 2  # keep even
 
     def _find_source(conf_id, t_start):
         """Find the source segment covering t_start for given conf_id."""
@@ -357,56 +359,27 @@ def _build_speaker_switched_segments(
         if duration < 0.1:
             continue
 
-        # Find the source segment for the active speaker
-        src_path, seg_start = _find_source(conf_id, t_start)
-
-        if src_path is None:
-            # Fallback: try any conf
-            for cid, segs in conf_segs.items():
-                for path, ss, sd, se in segs:
-                    if ss <= t_start + 0.5 and se >= t_start + 0.5:
-                        src_path, seg_start = path, ss
-                        break
-                if src_path:
-                    break
-
-        if src_path is None:
-            continue
-
-        offset = t_start - seg_start
         seg_path = os.path.join(speaker_dir, f'speaker_{i:04d}.mp4')
 
-        # If this is a non-admin segment, mix admin audio in so the
-        # organizer's voice is always audible (e.g. answering questions)
-        admin_src, admin_start = None, None
-        if conf_id != admin_conf and admin_conf is not None:
-            admin_src, admin_start = _find_source(admin_conf, t_start)
+        # Always find admin source
+        admin_src, admin_start = _find_source(admin_conf, t_start) \
+            if admin_conf else (None, None)
 
-        if admin_src is not None:
-            admin_offset = t_start - admin_start
-            _run_ffmpeg(
-                [
-                    'ffmpeg', '-y', '-v', 'error',
-                    '-ss', str(max(0, offset)),
-                    '-i', src_path,
-                    '-ss', str(max(0, admin_offset)),
-                    '-i', admin_src,
-                    '-t', str(duration),
-                    '-filter_complex',
-                    f'[0:v]scale={target_w}:{target_h}:force_original_aspect_ratio=decrease,'
-                    f'pad={target_w}:{target_h}:(ow-iw)/2:(oh-ih)/2:black,setsar=1[v];'
-                    f'[0:a][1:a]amix=inputs=2:duration=first:normalize=0[a]',
-                    '-map', '[v]', '-map', '[a]',
-                    *_get_video_encoder_fast(),
-                    '-pix_fmt', 'yuv420p',
-                    '-c:a', 'aac', '-b:a', '128k', '-ar', '44100', '-ac', '2',
-                    '-r', '25',
-                    seg_path,
-                ],
-                description=f'speaker segment {i+1}/{len(speaker_timeline)} '
-                            f'({duration:.0f}s, conf {conf_id} + admin audio)',
-            )
-        else:
+        if conf_id == admin_conf or admin_conf is None:
+            # Admin interval: show admin webcam full size
+            src_path, seg_start = _find_source(conf_id, t_start)
+            if src_path is None:
+                # Fallback: try any conf
+                for cid, segs in conf_segs.items():
+                    for path, ss, sd, se in segs:
+                        if ss <= t_start + 0.5 and se >= t_start + 0.5:
+                            src_path, seg_start = path, ss
+                            break
+                    if src_path:
+                        break
+            if src_path is None:
+                continue
+            offset = t_start - seg_start
             _run_ffmpeg(
                 [
                     'ffmpeg', '-y', '-v', 'error',
@@ -422,8 +395,82 @@ def _build_speaker_switched_segments(
                     seg_path,
                 ],
                 description=f'speaker segment {i+1}/{len(speaker_timeline)} '
-                            f'({duration:.0f}s, conf {conf_id})',
+                            f'({duration:.0f}s, admin)',
             )
+        else:
+            # Non-admin interval: admin top + participant bottom, mixed audio
+            participant_src, participant_start = _find_source(conf_id, t_start)
+            if participant_src is None:
+                # No participant source — just use admin
+                if admin_src is None:
+                    continue
+                offset = t_start - admin_start
+                _run_ffmpeg(
+                    [
+                        'ffmpeg', '-y', '-v', 'error',
+                        '-ss', str(max(0, offset)),
+                        '-i', admin_src,
+                        '-t', str(duration),
+                        '-vf', f'scale={target_w}:{target_h}:force_original_aspect_ratio=decrease,'
+                               f'pad={target_w}:{target_h}:(ow-iw)/2:(oh-ih)/2:black,setsar=1',
+                        *_get_video_encoder_fast(),
+                        '-pix_fmt', 'yuv420p',
+                        '-c:a', 'aac', '-b:a', '128k', '-ar', '44100', '-ac', '2',
+                        '-r', '25',
+                        seg_path,
+                    ],
+                    description=f'speaker segment {i+1}/{len(speaker_timeline)} '
+                                f'({duration:.0f}s, admin fallback)',
+                )
+            elif admin_src is not None:
+                # Both available: admin top, participant bottom, mixed audio
+                p_offset = t_start - participant_start
+                a_offset = t_start - admin_start
+                _run_ffmpeg(
+                    [
+                        'ffmpeg', '-y', '-v', 'error',
+                        '-ss', str(max(0, a_offset)),
+                        '-i', admin_src,
+                        '-ss', str(max(0, p_offset)),
+                        '-i', participant_src,
+                        '-t', str(duration),
+                        '-filter_complex',
+                        f'[0:v]scale={target_w}:{half_h}:force_original_aspect_ratio=decrease,'
+                        f'pad={target_w}:{half_h}:(ow-iw)/2:(oh-ih)/2:black,setsar=1[admin];'
+                        f'[1:v]scale={target_w}:{half_h}:force_original_aspect_ratio=decrease,'
+                        f'pad={target_w}:{half_h}:(ow-iw)/2:(oh-ih)/2:black,setsar=1[part];'
+                        f'[admin][part]vstack[v];'
+                        f'[0:a][1:a]amix=inputs=2:duration=first:normalize=0[a]',
+                        '-map', '[v]', '-map', '[a]',
+                        *_get_video_encoder_fast(),
+                        '-pix_fmt', 'yuv420p',
+                        '-c:a', 'aac', '-b:a', '128k', '-ar', '44100', '-ac', '2',
+                        '-r', '25',
+                        seg_path,
+                    ],
+                    description=f'speaker segment {i+1}/{len(speaker_timeline)} '
+                                f'({duration:.0f}s, admin+participant)',
+                )
+            else:
+                # No admin source — just use participant
+                p_offset = t_start - participant_start
+                _run_ffmpeg(
+                    [
+                        'ffmpeg', '-y', '-v', 'error',
+                        '-ss', str(max(0, p_offset)),
+                        '-i', participant_src,
+                        '-t', str(duration),
+                        '-vf', f'scale={target_w}:{target_h}:force_original_aspect_ratio=decrease,'
+                               f'pad={target_w}:{target_h}:(ow-iw)/2:(oh-ih)/2:black,setsar=1',
+                        *_get_video_encoder_fast(),
+                        '-pix_fmt', 'yuv420p',
+                        '-c:a', 'aac', '-b:a', '128k', '-ar', '44100', '-ac', '2',
+                        '-r', '25',
+                        seg_path,
+                    ],
+                    description=f'speaker segment {i+1}/{len(speaker_timeline)} '
+                                f'({duration:.0f}s, participant only)',
+                )
         result.append((seg_path, t_start))
 
     logging.info(f'Speaker switching: built {len(result)} segments')
