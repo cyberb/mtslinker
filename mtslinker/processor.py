@@ -4,7 +4,6 @@ import math
 import os
 import shutil
 import subprocess
-from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Dict, List, Tuple, Union
 
@@ -195,7 +194,7 @@ def _build_speaker_timeline(
     from collections import defaultdict
 
     if not video_files:
-        return [], None
+        return []
 
     # Group by conf_id, identify admin conf
     conf_segments = defaultdict(list)  # conf_id -> [(path, start_time)]
@@ -213,7 +212,7 @@ def _build_speaker_timeline(
             conf_is_admin[conf_id] = True
 
     if not conf_segments:
-        return [], None
+        return []
 
     # Find admin conf (most duration among admin confs, or most duration overall)
     conf_total_dur = {}
@@ -311,27 +310,27 @@ def _build_speaker_timeline(
         f'{non_admin_time:.0f}s non-admin out of {total_duration:.0f}s'
     )
 
-    return intervals, admin_conf
+    return intervals
 
 
 def _build_speaker_switched_segments(
     video_files: list,
     speaker_timeline: List[Tuple[float, float, str]],
-    admin_conf: str,
     tmp_dir: str,
     target_w: int,
     target_h: int,
 ) -> List[Tuple[str, float]]:
     """Cut webcam segments according to the speaker timeline.
 
-    Layout: admin webcam always shown (top). When a non-admin speaks,
-    their webcam appears below the admin's. Admin audio is always present.
-    Returns [(path, start_time), ...] for concatenation.
+    For each interval, extracts the appropriate slice from the source
+    webcam segment for that conf_id. Returns [(path, start_time), ...]
+    in the same format as _deduplicate_overlapping.
     """
     if not speaker_timeline:
         return []
 
     # Build lookup: conf_id -> sorted [(path, start, duration, end)]
+    from collections import defaultdict
     conf_segs = defaultdict(list)
     for item in video_files:
         path, start = item[0], item[1]
@@ -344,235 +343,53 @@ def _build_speaker_switched_segments(
     speaker_dir = os.path.join(tmp_dir, 'speaker_segments')
     os.makedirs(speaker_dir, exist_ok=True)
 
-    half_h = target_h // 2
-    half_h -= half_h % 2  # keep even
-
-    def _find_source(conf_id, t_start):
-        """Find the source segment covering t_start for given conf_id."""
-        for path, seg_start, seg_dur, seg_end in conf_segs.get(conf_id, []):
-            if seg_start <= t_start + 0.5 and seg_end >= t_start + 0.5:
-                return path, seg_start
-        return None, None
-
-    def _find_all_sources(t_start):
-        """Find ALL webcam sources covering t_start, returns [(path, offset)]."""
-        sources = []
-        seen = set()
-        for conf_id, segs in conf_segs.items():
-            for path, seg_start, seg_dur, seg_end in segs:
-                if seg_start <= t_start + 0.5 and seg_end >= t_start + 0.5:
-                    if path not in seen:
-                        seen.add(path)
-                        sources.append((path, t_start - seg_start))
-        return sources
-
     result = []
     for i, (t_start, t_end, conf_id) in enumerate(speaker_timeline):
         duration = t_end - t_start
         if duration < 0.1:
             continue
 
+        # Find the source segment covering this interval
+        source = None
+        for path, seg_start, seg_dur, seg_end in conf_segs.get(conf_id, []):
+            if seg_start <= t_start + 0.5 and seg_end >= t_start + 0.5:
+                source = (path, seg_start)
+                break
+
+        if source is None:
+            # No segment for this conf_id at this time — try any conf
+            for cid, segs in conf_segs.items():
+                for path, seg_start, seg_dur, seg_end in segs:
+                    if seg_start <= t_start + 0.5 and seg_end >= t_start + 0.5:
+                        source = (path, seg_start)
+                        break
+                if source:
+                    break
+
+        if source is None:
+            continue
+
+        src_path, seg_start = source
+        offset = t_start - seg_start
         seg_path = os.path.join(speaker_dir, f'speaker_{i:04d}.mp4')
 
-        # Always find admin source
-        admin_src, admin_start = _find_source(admin_conf, t_start) \
-            if admin_conf else (None, None)
-
-        if conf_id == admin_conf or admin_conf is None:
-            # Admin interval: show admin webcam full size
-            src_path, seg_start = _find_source(conf_id, t_start)
-            if src_path is None:
-                # Fallback: try any conf
-                for cid, segs in conf_segs.items():
-                    for path, ss, sd, se in segs:
-                        if ss <= t_start + 0.5 and se >= t_start + 0.5:
-                            src_path, seg_start = path, ss
-                            break
-                    if src_path:
-                        break
-            if src_path is None:
-                continue
-            offset = t_start - seg_start
-            _run_ffmpeg(
-                [
-                    'ffmpeg', '-y', '-v', 'error',
-                    '-ss', str(max(0, offset)),
-                    '-i', src_path,
-                    '-t', str(duration),
-                    '-vf', f'scale={target_w}:{target_h}:force_original_aspect_ratio=decrease,'
-                           f'pad={target_w}:{target_h}:(ow-iw)/2:(oh-ih)/2:black,setsar=1',
-                    *_get_video_encoder_fast(),
-                    '-pix_fmt', 'yuv420p',
-                    '-c:a', 'aac', '-b:a', '128k', '-ar', '44100', '-ac', '2',
-                    '-r', '25',
-                    seg_path,
-                ],
-                description=f'speaker segment {i+1}/{len(speaker_timeline)} '
-                            f'({duration:.0f}s, admin)',
-            )
-        else:
-            # Non-admin interval: admin top + participant bottom, mixed audio
-            participant_src, participant_start = _find_source(conf_id, t_start)
-            if participant_src is None:
-                # No participant source — just use admin
-                if admin_src is None:
-                    continue
-                offset = t_start - admin_start
-                _run_ffmpeg(
-                    [
-                        'ffmpeg', '-y', '-v', 'error',
-                        '-ss', str(max(0, offset)),
-                        '-i', admin_src,
-                        '-t', str(duration),
-                        '-vf', f'scale={target_w}:{target_h}:force_original_aspect_ratio=decrease,'
-                               f'pad={target_w}:{target_h}:(ow-iw)/2:(oh-ih)/2:black,setsar=1',
-                        *_get_video_encoder_fast(),
-                        '-pix_fmt', 'yuv420p',
-                        '-c:a', 'aac', '-b:a', '128k', '-ar', '44100', '-ac', '2',
-                        '-r', '25',
-                        seg_path,
-                    ],
-                    description=f'speaker segment {i+1}/{len(speaker_timeline)} '
-                                f'({duration:.0f}s, admin fallback)',
-                )
-            elif admin_src is not None:
-                # Admin top + participant bottom, mix ALL available audio
-                p_offset = t_start - participant_start
-                a_offset = t_start - admin_start
-
-                # Find all webcam audio sources at this time
-                all_sources = _find_all_sources(t_start)
-
-                # Build inputs: 0=admin(video+audio), 1=participant(video+audio),
-                # 2..N=extra audio sources
-                inputs = [
-                    '-ss', str(max(0, a_offset)), '-i', admin_src,
-                    '-ss', str(max(0, p_offset)), '-i', participant_src,
-                ]
-                extra_audio = []
-                for src_path_extra, src_offset in all_sources:
-                    if src_path_extra in (admin_src, participant_src):
-                        continue
-                    idx = len(inputs) // 4 + len(extra_audio) + 2
-                    inputs.extend(['-ss', str(max(0, src_offset)),
-                                   '-i', src_path_extra])
-                    extra_audio.append(idx)
-
-                # Build audio mix filter
-                n_audio = 2 + len(extra_audio)
-                audio_labels = '[0:a][1:a]' + ''.join(
-                    f'[{idx}:a]' for idx in extra_audio
-                )
-                audio_filter = (
-                    f'{audio_labels}amix=inputs={n_audio}'
-                    f':duration=first:normalize=0[a]'
-                )
-
-                vfilter = (
-                    f'[0:v]scale={target_w}:{half_h}:force_original_aspect_ratio=decrease,'
-                    f'pad={target_w}:{half_h}:(ow-iw)/2:(oh-ih)/2:black,setsar=1[admin];'
-                    f'[1:v]scale={target_w}:{half_h}:force_original_aspect_ratio=decrease,'
-                    f'pad={target_w}:{half_h}:(ow-iw)/2:(oh-ih)/2:black,setsar=1[part];'
-                    f'[admin][part]vstack[v];'
-                    f'{audio_filter}'
-                )
-
-                try:
-                    _run_ffmpeg(
-                        [
-                            'ffmpeg', '-y', '-v', 'error',
-                            *inputs,
-                            '-t', str(duration),
-                            '-filter_complex', vfilter,
-                            '-map', '[v]', '-map', '[a]',
-                            *_get_video_encoder_fast(),
-                            '-pix_fmt', 'yuv420p',
-                            '-c:a', 'aac', '-b:a', '128k', '-ar', '44100', '-ac', '2',
-                            '-r', '25',
-                            seg_path,
-                        ],
-                        description=f'speaker segment {i+1}/{len(speaker_timeline)} '
-                                    f'({duration:.0f}s, admin+participant+{len(extra_audio)} extra)',
-                    )
-                except subprocess.CalledProcessError:
-                    # Fallback: admin only if complex mix fails
-                    logging.warning(f'Multi-audio failed for segment {i}, using admin only')
-                    _run_ffmpeg(
-                        [
-                            'ffmpeg', '-y', '-v', 'error',
-                            '-ss', str(max(0, a_offset)),
-                            '-i', admin_src,
-                            '-t', str(duration),
-                            '-vf', f'scale={target_w}:{target_h}:force_original_aspect_ratio=decrease,'
-                                   f'pad={target_w}:{target_h}:(ow-iw)/2:(oh-ih)/2:black,setsar=1',
-                            *_get_video_encoder_fast(),
-                            '-pix_fmt', 'yuv420p',
-                            '-c:a', 'aac', '-b:a', '128k', '-ar', '44100', '-ac', '2',
-                            '-r', '25',
-                            seg_path,
-                        ],
-                        description=f'speaker segment {i+1}/{len(speaker_timeline)} '
-                                    f'({duration:.0f}s, admin fallback)',
-                    )
-            else:
-                # No admin source — participant + all other audio
-                p_offset = t_start - participant_start
-                all_sources = _find_all_sources(t_start)
-                inputs = ['-ss', str(max(0, p_offset)), '-i', participant_src]
-                extra_audio = []
-                for src_path_extra, src_offset in all_sources:
-                    if src_path_extra == participant_src:
-                        continue
-                    idx = 1 + len(extra_audio)
-                    inputs.extend(['-ss', str(max(0, src_offset)),
-                                   '-i', src_path_extra])
-                    extra_audio.append(idx)
-
-                if extra_audio:
-                    n_audio = 1 + len(extra_audio)
-                    audio_labels = '[0:a]' + ''.join(
-                        f'[{idx}:a]' for idx in extra_audio
-                    )
-                    audio_filter = (
-                        f'{audio_labels}amix=inputs={n_audio}'
-                        f':duration=first:normalize=0[a]'
-                    )
-                    vf = (
-                        f'[0:v]scale={target_w}:{target_h}:force_original_aspect_ratio=decrease,'
-                        f'pad={target_w}:{target_h}:(ow-iw)/2:(oh-ih)/2:black,setsar=1[v];'
-                        f'{audio_filter}'
-                    )
-                    _run_ffmpeg(
-                        [
-                            'ffmpeg', '-y', '-v', 'error',
-                            *inputs, '-t', str(duration),
-                            '-filter_complex', vf,
-                            '-map', '[v]', '-map', '[a]',
-                            *_get_video_encoder_fast(),
-                            '-pix_fmt', 'yuv420p',
-                            '-c:a', 'aac', '-b:a', '128k', '-ar', '44100', '-ac', '2',
-                            '-r', '25',
-                            seg_path,
-                        ],
-                        description=f'speaker segment {i+1}/{len(speaker_timeline)} '
-                                    f'({duration:.0f}s, participant+{len(extra_audio)} extra)',
-                    )
-                else:
-                    _run_ffmpeg(
-                        [
-                            'ffmpeg', '-y', '-v', 'error',
-                            *inputs, '-t', str(duration),
-                            '-vf', f'scale={target_w}:{target_h}:force_original_aspect_ratio=decrease,'
-                                   f'pad={target_w}:{target_h}:(ow-iw)/2:(oh-ih)/2:black,setsar=1',
-                            *_get_video_encoder_fast(),
-                            '-pix_fmt', 'yuv420p',
-                            '-c:a', 'aac', '-b:a', '128k', '-ar', '44100', '-ac', '2',
-                            '-r', '25',
-                            seg_path,
-                        ],
-                        description=f'speaker segment {i+1}/{len(speaker_timeline)} '
-                                    f'({duration:.0f}s, participant only)',
-                    )
+        _run_ffmpeg(
+            [
+                'ffmpeg', '-y', '-v', 'error',
+                '-ss', str(max(0, offset)),
+                '-i', src_path,
+                '-t', str(duration),
+                '-vf', f'scale={target_w}:{target_h}:force_original_aspect_ratio=decrease,'
+                       f'pad={target_w}:{target_h}:(ow-iw)/2:(oh-ih)/2:black,setsar=1',
+                *_get_video_encoder_fast(),
+                '-pix_fmt', 'yuv420p',
+                '-c:a', 'aac', '-b:a', '128k', '-ar', '44100', '-ac', '2',
+                '-r', '25',
+                seg_path,
+            ],
+            description=f'speaker segment {i+1}/{len(speaker_timeline)} '
+                        f'({duration:.0f}s, conf {conf_id})',
+        )
         result.append((seg_path, t_start))
 
     logging.info(f'Speaker switching: built {len(result)} segments')
@@ -1394,15 +1211,15 @@ def compile_final_video(
             break
 
     if has_overlaps and slide_events:
-        # Active speaker switching: show the talking person's webcam
-        logging.info('Multiple concurrent webcams + slides, using speaker switching')
-        speaker_timeline, admin_conf = _build_speaker_timeline(
-            video_files, total_duration,
-        )
-        video_files = _build_speaker_switched_segments(
-            video_files, speaker_timeline, admin_conf,
-            tmp_dir, target_w, target_h,
-        )
+        # Keep admin webcam, move other webcam audio to audio_files
+        logging.info('Multiple concurrent webcams + slides, keeping admin webcam')
+        deduped = _deduplicate_overlapping(video_files)
+        # Find webcam files that were dropped — add their audio to the mix
+        kept_paths = {v[0] for v in deduped}
+        for vpath, start_time, *_ in video_files:
+            if vpath not in kept_paths:
+                audio_files.append((vpath, start_time))
+        video_files = deduped
     elif has_overlaps:
         # Grid layout: composite all concurrent webcams into a grid
         logging.info('Multiple concurrent webcams detected, building grid layout')
