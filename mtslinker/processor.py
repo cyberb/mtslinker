@@ -310,12 +310,13 @@ def _build_speaker_timeline(
         f'{non_admin_time:.0f}s non-admin out of {total_duration:.0f}s'
     )
 
-    return intervals
+    return intervals, admin_conf
 
 
 def _build_speaker_switched_segments(
     video_files: list,
     speaker_timeline: List[Tuple[float, float, str]],
+    admin_conf: str,
     tmp_dir: str,
     target_w: int,
     target_h: int,
@@ -343,53 +344,86 @@ def _build_speaker_switched_segments(
     speaker_dir = os.path.join(tmp_dir, 'speaker_segments')
     os.makedirs(speaker_dir, exist_ok=True)
 
+    def _find_source(conf_id, t_start):
+        """Find the source segment covering t_start for given conf_id."""
+        for path, seg_start, seg_dur, seg_end in conf_segs.get(conf_id, []):
+            if seg_start <= t_start + 0.5 and seg_end >= t_start + 0.5:
+                return path, seg_start
+        return None, None
+
     result = []
     for i, (t_start, t_end, conf_id) in enumerate(speaker_timeline):
         duration = t_end - t_start
         if duration < 0.1:
             continue
 
-        # Find the source segment covering this interval
-        source = None
-        for path, seg_start, seg_dur, seg_end in conf_segs.get(conf_id, []):
-            if seg_start <= t_start + 0.5 and seg_end >= t_start + 0.5:
-                source = (path, seg_start)
-                break
+        # Find the source segment for the active speaker
+        src_path, seg_start = _find_source(conf_id, t_start)
 
-        if source is None:
-            # No segment for this conf_id at this time — try any conf
+        if src_path is None:
+            # Fallback: try any conf
             for cid, segs in conf_segs.items():
-                for path, seg_start, seg_dur, seg_end in segs:
-                    if seg_start <= t_start + 0.5 and seg_end >= t_start + 0.5:
-                        source = (path, seg_start)
+                for path, ss, sd, se in segs:
+                    if ss <= t_start + 0.5 and se >= t_start + 0.5:
+                        src_path, seg_start = path, ss
                         break
-                if source:
+                if src_path:
                     break
 
-        if source is None:
+        if src_path is None:
             continue
 
-        src_path, seg_start = source
         offset = t_start - seg_start
         seg_path = os.path.join(speaker_dir, f'speaker_{i:04d}.mp4')
 
-        _run_ffmpeg(
-            [
-                'ffmpeg', '-y', '-v', 'error',
-                '-ss', str(max(0, offset)),
-                '-i', src_path,
-                '-t', str(duration),
-                '-vf', f'scale={target_w}:{target_h}:force_original_aspect_ratio=decrease,'
-                       f'pad={target_w}:{target_h}:(ow-iw)/2:(oh-ih)/2:black,setsar=1',
-                *_get_video_encoder_fast(),
-                '-pix_fmt', 'yuv420p',
-                '-c:a', 'aac', '-b:a', '128k', '-ar', '44100', '-ac', '2',
-                '-r', '25',
-                seg_path,
-            ],
-            description=f'speaker segment {i+1}/{len(speaker_timeline)} '
-                        f'({duration:.0f}s, conf {conf_id})',
-        )
+        # If this is a non-admin segment, mix admin audio in so the
+        # organizer's voice is always audible (e.g. answering questions)
+        admin_src, admin_start = None, None
+        if conf_id != admin_conf and admin_conf is not None:
+            admin_src, admin_start = _find_source(admin_conf, t_start)
+
+        if admin_src is not None:
+            admin_offset = t_start - admin_start
+            _run_ffmpeg(
+                [
+                    'ffmpeg', '-y', '-v', 'error',
+                    '-ss', str(max(0, offset)),
+                    '-i', src_path,
+                    '-ss', str(max(0, admin_offset)),
+                    '-i', admin_src,
+                    '-t', str(duration),
+                    '-filter_complex',
+                    f'[0:v]scale={target_w}:{target_h}:force_original_aspect_ratio=decrease,'
+                    f'pad={target_w}:{target_h}:(ow-iw)/2:(oh-ih)/2:black,setsar=1[v];'
+                    f'[0:a][1:a]amix=inputs=2:duration=first:normalize=0[a]',
+                    '-map', '[v]', '-map', '[a]',
+                    *_get_video_encoder_fast(),
+                    '-pix_fmt', 'yuv420p',
+                    '-c:a', 'aac', '-b:a', '128k', '-ar', '44100', '-ac', '2',
+                    '-r', '25',
+                    seg_path,
+                ],
+                description=f'speaker segment {i+1}/{len(speaker_timeline)} '
+                            f'({duration:.0f}s, conf {conf_id} + admin audio)',
+            )
+        else:
+            _run_ffmpeg(
+                [
+                    'ffmpeg', '-y', '-v', 'error',
+                    '-ss', str(max(0, offset)),
+                    '-i', src_path,
+                    '-t', str(duration),
+                    '-vf', f'scale={target_w}:{target_h}:force_original_aspect_ratio=decrease,'
+                           f'pad={target_w}:{target_h}:(ow-iw)/2:(oh-ih)/2:black,setsar=1',
+                    *_get_video_encoder_fast(),
+                    '-pix_fmt', 'yuv420p',
+                    '-c:a', 'aac', '-b:a', '128k', '-ar', '44100', '-ac', '2',
+                    '-r', '25',
+                    seg_path,
+                ],
+                description=f'speaker segment {i+1}/{len(speaker_timeline)} '
+                            f'({duration:.0f}s, conf {conf_id})',
+            )
         result.append((seg_path, t_start))
 
     logging.info(f'Speaker switching: built {len(result)} segments')
@@ -1213,11 +1247,12 @@ def compile_final_video(
     if has_overlaps and slide_events:
         # Active speaker switching: show the talking person's webcam
         logging.info('Multiple concurrent webcams + slides, using speaker switching')
-        speaker_timeline = _build_speaker_timeline(
+        speaker_timeline, admin_conf = _build_speaker_timeline(
             video_files, total_duration,
         )
         video_files = _build_speaker_switched_segments(
-            video_files, speaker_timeline, tmp_dir, target_w, target_h,
+            video_files, speaker_timeline, admin_conf,
+            tmp_dir, target_w, target_h,
         )
     elif has_overlaps:
         # Grid layout: composite all concurrent webcams into a grid
