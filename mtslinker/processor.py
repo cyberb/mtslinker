@@ -4,6 +4,7 @@ import math
 import os
 import shutil
 import subprocess
+from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Dict, List, Tuple, Union
 
@@ -194,7 +195,7 @@ def _build_speaker_timeline(
     from collections import defaultdict
 
     if not video_files:
-        return []
+        return [], None
 
     # Group by conf_id, identify admin conf
     conf_segments = defaultdict(list)  # conf_id -> [(path, start_time)]
@@ -212,7 +213,7 @@ def _build_speaker_timeline(
             conf_is_admin[conf_id] = True
 
     if not conf_segments:
-        return []
+        return [], None
 
     # Find admin conf (most duration among admin confs, or most duration overall)
     conf_total_dur = {}
