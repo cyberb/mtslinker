@@ -354,6 +354,18 @@ def _build_speaker_switched_segments(
                 return path, seg_start
         return None, None
 
+    def _find_all_sources(t_start):
+        """Find ALL webcam sources covering t_start, returns [(path, offset)]."""
+        sources = []
+        seen = set()
+        for conf_id, segs in conf_segs.items():
+            for path, seg_start, seg_dur, seg_end in segs:
+                if seg_start <= t_start + 0.5 and seg_end >= t_start + 0.5:
+                    if path not in seen:
+                        seen.add(path)
+                        sources.append((path, t_start - seg_start))
+        return sources
+
     result = []
     for i, (t_start, t_end, conf_id) in enumerate(speaker_timeline):
         duration = t_end - t_start
@@ -424,25 +436,54 @@ def _build_speaker_switched_segments(
                                 f'({duration:.0f}s, admin fallback)',
                 )
             elif admin_src is not None:
-                # Both available: admin top, participant bottom, mixed audio
+                # Admin top + participant bottom, mix ALL available audio
                 p_offset = t_start - participant_start
                 a_offset = t_start - admin_start
+
+                # Find all webcam audio sources at this time
+                all_sources = _find_all_sources(t_start)
+
+                # Build inputs: 0=admin(video+audio), 1=participant(video+audio),
+                # 2..N=extra audio sources
+                inputs = [
+                    '-ss', str(max(0, a_offset)), '-i', admin_src,
+                    '-ss', str(max(0, p_offset)), '-i', participant_src,
+                ]
+                extra_audio = []
+                for src_path_extra, src_offset in all_sources:
+                    if src_path_extra in (admin_src, participant_src):
+                        continue
+                    idx = len(inputs) // 4 + len(extra_audio) + 2
+                    inputs.extend(['-ss', str(max(0, src_offset)),
+                                   '-i', src_path_extra])
+                    extra_audio.append(idx)
+
+                # Build audio mix filter
+                n_audio = 2 + len(extra_audio)
+                audio_labels = '[0:a][1:a]' + ''.join(
+                    f'[{idx}:a]' for idx in extra_audio
+                )
+                audio_filter = (
+                    f'{audio_labels}amix=inputs={n_audio}'
+                    f':duration=first:normalize=0[a]'
+                )
+
+                vfilter = (
+                    f'[0:v]scale={target_w}:{half_h}:force_original_aspect_ratio=decrease,'
+                    f'pad={target_w}:{half_h}:(ow-iw)/2:(oh-ih)/2:black,setsar=1[admin];'
+                    f'[1:v]scale={target_w}:{half_h}:force_original_aspect_ratio=decrease,'
+                    f'pad={target_w}:{half_h}:(ow-iw)/2:(oh-ih)/2:black,setsar=1[part];'
+                    f'[admin][part]vstack[v];'
+                    f'{audio_filter}'
+                )
+
                 try:
                     _run_ffmpeg(
                         [
                             'ffmpeg', '-y', '-v', 'error',
-                            '-ss', str(max(0, a_offset)),
-                            '-i', admin_src,
-                            '-ss', str(max(0, p_offset)),
-                            '-i', participant_src,
+                            *inputs,
                             '-t', str(duration),
-                            '-filter_complex',
-                            f'[0:v]scale={target_w}:{half_h}:force_original_aspect_ratio=decrease,'
-                            f'pad={target_w}:{half_h}:(ow-iw)/2:(oh-ih)/2:black,setsar=1[admin];'
-                            f'[1:v]scale={target_w}:{half_h}:force_original_aspect_ratio=decrease,'
-                            f'pad={target_w}:{half_h}:(ow-iw)/2:(oh-ih)/2:black,setsar=1[part];'
-                            f'[admin][part]vstack[v];'
-                            f'[0:a][1:a]amix=inputs=2:duration=first:normalize=0[a]',
+                            '-filter_complex', vfilter,
                             '-map', '[v]', '-map', '[a]',
                             *_get_video_encoder_fast(),
                             '-pix_fmt', 'yuv420p',
@@ -451,11 +492,11 @@ def _build_speaker_switched_segments(
                             seg_path,
                         ],
                         description=f'speaker segment {i+1}/{len(speaker_timeline)} '
-                                    f'({duration:.0f}s, admin+participant)',
+                                    f'({duration:.0f}s, admin+participant+{len(extra_audio)} extra)',
                     )
                 except subprocess.CalledProcessError:
-                    # Fallback: admin only if vstack fails
-                    logging.warning(f'Dual-webcam failed for segment {i}, using admin only')
+                    # Fallback: admin only if complex mix fails
+                    logging.warning(f'Multi-audio failed for segment {i}, using admin only')
                     _run_ffmpeg(
                         [
                             'ffmpeg', '-y', '-v', 'error',
@@ -471,28 +512,67 @@ def _build_speaker_switched_segments(
                             seg_path,
                         ],
                         description=f'speaker segment {i+1}/{len(speaker_timeline)} '
-                                    f'({duration:.0f}s, admin fallback after vstack fail)',
+                                    f'({duration:.0f}s, admin fallback)',
                     )
             else:
-                # No admin source — just use participant
+                # No admin source — participant + all other audio
                 p_offset = t_start - participant_start
-                _run_ffmpeg(
-                    [
-                        'ffmpeg', '-y', '-v', 'error',
-                        '-ss', str(max(0, p_offset)),
-                        '-i', participant_src,
-                        '-t', str(duration),
-                        '-vf', f'scale={target_w}:{target_h}:force_original_aspect_ratio=decrease,'
-                               f'pad={target_w}:{target_h}:(ow-iw)/2:(oh-ih)/2:black,setsar=1',
-                        *_get_video_encoder_fast(),
-                        '-pix_fmt', 'yuv420p',
-                        '-c:a', 'aac', '-b:a', '128k', '-ar', '44100', '-ac', '2',
-                        '-r', '25',
-                        seg_path,
-                    ],
-                    description=f'speaker segment {i+1}/{len(speaker_timeline)} '
-                                f'({duration:.0f}s, participant only)',
-                )
+                all_sources = _find_all_sources(t_start)
+                inputs = ['-ss', str(max(0, p_offset)), '-i', participant_src]
+                extra_audio = []
+                for src_path_extra, src_offset in all_sources:
+                    if src_path_extra == participant_src:
+                        continue
+                    idx = 1 + len(extra_audio)
+                    inputs.extend(['-ss', str(max(0, src_offset)),
+                                   '-i', src_path_extra])
+                    extra_audio.append(idx)
+
+                if extra_audio:
+                    n_audio = 1 + len(extra_audio)
+                    audio_labels = '[0:a]' + ''.join(
+                        f'[{idx}:a]' for idx in extra_audio
+                    )
+                    audio_filter = (
+                        f'{audio_labels}amix=inputs={n_audio}'
+                        f':duration=first:normalize=0[a]'
+                    )
+                    vf = (
+                        f'[0:v]scale={target_w}:{target_h}:force_original_aspect_ratio=decrease,'
+                        f'pad={target_w}:{target_h}:(ow-iw)/2:(oh-ih)/2:black,setsar=1[v];'
+                        f'{audio_filter}'
+                    )
+                    _run_ffmpeg(
+                        [
+                            'ffmpeg', '-y', '-v', 'error',
+                            *inputs, '-t', str(duration),
+                            '-filter_complex', vf,
+                            '-map', '[v]', '-map', '[a]',
+                            *_get_video_encoder_fast(),
+                            '-pix_fmt', 'yuv420p',
+                            '-c:a', 'aac', '-b:a', '128k', '-ar', '44100', '-ac', '2',
+                            '-r', '25',
+                            seg_path,
+                        ],
+                        description=f'speaker segment {i+1}/{len(speaker_timeline)} '
+                                    f'({duration:.0f}s, participant+{len(extra_audio)} extra)',
+                    )
+                else:
+                    _run_ffmpeg(
+                        [
+                            'ffmpeg', '-y', '-v', 'error',
+                            *inputs, '-t', str(duration),
+                            '-vf', f'scale={target_w}:{target_h}:force_original_aspect_ratio=decrease,'
+                                   f'pad={target_w}:{target_h}:(ow-iw)/2:(oh-ih)/2:black,setsar=1',
+                            *_get_video_encoder_fast(),
+                            '-pix_fmt', 'yuv420p',
+                            '-c:a', 'aac', '-b:a', '128k', '-ar', '44100', '-ac', '2',
+                            '-r', '25',
+                            seg_path,
+                        ],
+                        description=f'speaker segment {i+1}/{len(speaker_timeline)} '
+                                    f'({duration:.0f}s, participant only)',
+                    )
         result.append((seg_path, t_start))
 
     logging.info(f'Speaker switching: built {len(result)} segments')
