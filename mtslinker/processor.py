@@ -426,31 +426,52 @@ def _build_speaker_switched_segments(
                 # Both available: admin top, participant bottom, mixed audio
                 p_offset = t_start - participant_start
                 a_offset = t_start - admin_start
-                _run_ffmpeg(
-                    [
-                        'ffmpeg', '-y', '-v', 'error',
-                        '-ss', str(max(0, a_offset)),
-                        '-i', admin_src,
-                        '-ss', str(max(0, p_offset)),
-                        '-i', participant_src,
-                        '-t', str(duration),
-                        '-filter_complex',
-                        f'[0:v]scale={target_w}:{half_h}:force_original_aspect_ratio=decrease,'
-                        f'pad={target_w}:{half_h}:(ow-iw)/2:(oh-ih)/2:black,setsar=1[admin];'
-                        f'[1:v]scale={target_w}:{half_h}:force_original_aspect_ratio=decrease,'
-                        f'pad={target_w}:{half_h}:(ow-iw)/2:(oh-ih)/2:black,setsar=1[part];'
-                        f'[admin][part]vstack[v];'
-                        f'[0:a][1:a]amix=inputs=2:duration=first:normalize=0[a]',
-                        '-map', '[v]', '-map', '[a]',
-                        *_get_video_encoder_fast(),
-                        '-pix_fmt', 'yuv420p',
-                        '-c:a', 'aac', '-b:a', '128k', '-ar', '44100', '-ac', '2',
-                        '-r', '25',
-                        seg_path,
-                    ],
-                    description=f'speaker segment {i+1}/{len(speaker_timeline)} '
-                                f'({duration:.0f}s, admin+participant)',
-                )
+                try:
+                    _run_ffmpeg(
+                        [
+                            'ffmpeg', '-y', '-v', 'error',
+                            '-ss', str(max(0, a_offset)),
+                            '-i', admin_src,
+                            '-ss', str(max(0, p_offset)),
+                            '-i', participant_src,
+                            '-t', str(duration),
+                            '-filter_complex',
+                            f'[0:v]scale={target_w}:{half_h}:force_original_aspect_ratio=decrease,'
+                            f'pad={target_w}:{half_h}:(ow-iw)/2:(oh-ih)/2:black,setsar=1[admin];'
+                            f'[1:v]scale={target_w}:{half_h}:force_original_aspect_ratio=decrease,'
+                            f'pad={target_w}:{half_h}:(ow-iw)/2:(oh-ih)/2:black,setsar=1[part];'
+                            f'[admin][part]vstack[v];'
+                            f'[0:a][1:a]amix=inputs=2:duration=first:normalize=0[a]',
+                            '-map', '[v]', '-map', '[a]',
+                            *_get_video_encoder_fast(),
+                            '-pix_fmt', 'yuv420p',
+                            '-c:a', 'aac', '-b:a', '128k', '-ar', '44100', '-ac', '2',
+                            '-r', '25',
+                            seg_path,
+                        ],
+                        description=f'speaker segment {i+1}/{len(speaker_timeline)} '
+                                    f'({duration:.0f}s, admin+participant)',
+                    )
+                except subprocess.CalledProcessError:
+                    # Fallback: admin only if vstack fails
+                    logging.warning(f'Dual-webcam failed for segment {i}, using admin only')
+                    _run_ffmpeg(
+                        [
+                            'ffmpeg', '-y', '-v', 'error',
+                            '-ss', str(max(0, a_offset)),
+                            '-i', admin_src,
+                            '-t', str(duration),
+                            '-vf', f'scale={target_w}:{target_h}:force_original_aspect_ratio=decrease,'
+                                   f'pad={target_w}:{target_h}:(ow-iw)/2:(oh-ih)/2:black,setsar=1',
+                            *_get_video_encoder_fast(),
+                            '-pix_fmt', 'yuv420p',
+                            '-c:a', 'aac', '-b:a', '128k', '-ar', '44100', '-ac', '2',
+                            '-r', '25',
+                            seg_path,
+                        ],
+                        description=f'speaker segment {i+1}/{len(speaker_timeline)} '
+                                    f'({duration:.0f}s, admin fallback after vstack fail)',
+                    )
             else:
                 # No admin source — just use participant
                 p_offset = t_start - participant_start
