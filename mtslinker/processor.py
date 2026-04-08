@@ -1324,19 +1324,21 @@ def analyze_video(
                 max_dur = ns - start_time
                 break
 
+        # planned_duration = how long this segment should be in the output
+        planned_dur = max_dur if max_dur > 0 else f['duration']
         segments.append({
             'type': 'video',
             'source_path': f['path'],
             'start_time': start_time,
-            'duration': f['duration'],
+            'source_duration': f['duration'],
             'max_duration': max_dur,
+            'planned_duration': planned_dur,
             'has_audio': f['has_audio'],
+            'width': f['width'],
+            'height': f['height'],
         })
 
-        if max_dur > 0:
-            current_time = start_time + max_dur
-        else:
-            current_time = start_time + f['duration']
+        current_time = start_time + planned_dur
 
     # Trailing gap
     if current_time < total_duration - 0.1:
@@ -1414,9 +1416,26 @@ def analyze_video(
                  f'{len(all_audio)} audio tracks, '
                  f'strategy={overlap_strategy}')
 
+    # Validate: check for segments where source is shorter than planned
+    warnings = []
+    for seg in segments:
+        if seg['type'] != 'video':
+            continue
+        src_dur = seg['source_duration']
+        planned = seg['planned_duration']
+        if src_dur < planned - 1.0:
+            warnings.append(
+                f'Segment at {seg["start_time"]:.0f}s: source={src_dur:.0f}s '
+                f'but planned={planned:.0f}s (will pad {planned-src_dur:.0f}s black)'
+            )
+    manifest['warnings'] = warnings
+
     if errors:
         for e in errors:
             logging.warning(f'Analyze: {e}')
+    if warnings:
+        for w in warnings:
+            logging.warning(f'Analyze: {w}')
 
     return manifest
 
@@ -1507,7 +1526,23 @@ def execute_video(manifest: dict):
                                max_duration=seg.get('max_duration', 0))
             with_audio_path = os.path.join(tmp_dir, f'norma_{i}.mp4')
             final_seg = _ensure_audio_stream(norm_path, with_audio_path)
-            concat_segments.append(final_seg)
+
+            # Verify duration matches plan — pad with black if too short
+            actual_dur = _get_duration(final_seg)
+            planned_dur = seg.get('planned_duration', 0)
+            if planned_dur > 0 and actual_dur < planned_dur - 1.0:
+                shortfall = planned_dur - actual_dur
+                logging.warning(
+                    f'Segment {i} is {actual_dur:.1f}s but planned '
+                    f'{planned_dur:.1f}s — padding {shortfall:.1f}s'
+                )
+                pad_path = os.path.join(tmp_dir, f'pad_{i}.mp4')
+                _generate_black_segment(pad_path, shortfall,
+                                        target_w, target_h, target_pix_fmt)
+                concat_segments.append(final_seg)
+                concat_segments.append(pad_path)
+            else:
+                concat_segments.append(final_seg)
 
     # Step 4: Concatenate
     concat_list_path = os.path.join(tmp_dir, 'concat.txt')
