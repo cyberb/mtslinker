@@ -1214,19 +1214,33 @@ def compile_final_video(
         # Keep admin webcam, move other webcam audio to audio_files
         logging.info('Multiple concurrent webcams + slides, keeping admin webcam')
         deduped = _deduplicate_overlapping(video_files)
-        # Find webcam files that were dropped — add their audio to the mix
+        # Find webcam files that were dropped — extract their audio for mixing
         kept_paths = {v[0] for v in deduped}
+        extra_dir = os.path.join(tmp_dir, 'extra_audio')
+        os.makedirs(extra_dir, exist_ok=True)
         extra_audio = 0
         for vpath, start_time, *_ in video_files:
             if vpath not in kept_paths:
-                # Only add if the file has an audio stream
                 info = _ffprobe_streams(vpath)
                 has_audio = any(
                     s.get('codec_type') == 'audio' for s in info.get('streams', [])
                 )
                 if has_audio:
-                    audio_files.append((vpath, start_time))
-                    extra_audio += 1
+                    # Extract audio only (strip video) so amix works cleanly
+                    audio_path = os.path.join(extra_dir, f'extra_{extra_audio}.m4a')
+                    try:
+                        _run_ffmpeg(
+                            ['ffmpeg', '-y', '-v', 'error',
+                             '-i', vpath, '-vn',
+                             '-c:a', 'aac', '-b:a', '128k',
+                             '-ar', '44100', '-ac', '2',
+                             audio_path],
+                            description=f'extract audio from webcam {extra_audio}',
+                        )
+                        audio_files.append((audio_path, start_time))
+                        extra_audio += 1
+                    except subprocess.CalledProcessError:
+                        pass  # skip files that fail extraction
         logging.info(f'Added {extra_audio} webcam audio tracks to mix')
         video_files = deduped
     elif has_overlaps:
