@@ -1130,6 +1130,433 @@ def _composite_slides(
     return output_path
 
 
+def _probe_file(file_path: str) -> dict:
+    """Probe a single file and return all metadata needed for planning."""
+    info = _ffprobe_streams(file_path)
+    streams = info.get('streams', [])
+    fmt = info.get('format', {})
+
+    has_video = any(s.get('codec_type') == 'video' for s in streams)
+    has_audio = any(s.get('codec_type') == 'audio' for s in streams)
+
+    width, height, pix_fmt = 0, 0, 'yuv420p'
+    for s in streams:
+        if s.get('codec_type') == 'video':
+            width = int(s.get('width', 0))
+            height = int(s.get('height', 0))
+            pix_fmt = s.get('pix_fmt', 'yuv420p')
+            break
+
+    duration = 0.0
+    if 'duration' in fmt:
+        duration = float(fmt['duration'])
+    else:
+        for s in streams:
+            if 'duration' in s:
+                duration = float(s['duration'])
+                break
+
+    valid = bool(streams) and duration > 0
+
+    return {
+        'path': file_path,
+        'valid': valid,
+        'has_video': has_video,
+        'has_audio': has_audio,
+        'width': width,
+        'height': height,
+        'pix_fmt': pix_fmt,
+        'duration': duration,
+    }
+
+
+def _probe_all_files(downloaded_files: list) -> List[dict]:
+    """Probe all files in parallel. Returns list of file info dicts."""
+    results = []
+    paths = [(item[0], item[1],
+              item[2] if len(item) > 2 else None,
+              item[3] if len(item) > 3 else False)
+             for item in downloaded_files]
+
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        futures = {}
+        for path, start_time, conf_id, is_admin in paths:
+            fut = pool.submit(_probe_file, path)
+            futures[fut] = (start_time, conf_id, is_admin)
+        for fut in as_completed(futures):
+            start_time, conf_id, is_admin = futures[fut]
+            info = fut.result()
+            info['start_time'] = start_time
+            info['conf_id'] = conf_id
+            info['is_admin'] = is_admin
+            results.append(info)
+
+    results.sort(key=lambda x: x['start_time'])
+    return results
+
+
+def analyze_video(
+    total_duration: float,
+    downloaded_files: list,
+    directory: str,
+    output_path: str,
+    max_duration=None,
+    slide_events=None,
+) -> dict:
+    """Phase 1: Probe all files, make all decisions, write manifest.
+
+    Fast — only ffprobe calls, no re-encoding. Returns manifest dict
+    and writes it to {directory}/manifest.json.
+    """
+    _check_ffmpeg()
+    logging.info('Phase 1: Analyzing files...')
+
+    # Probe all files in parallel
+    all_files = _probe_all_files(downloaded_files)
+
+    # Classify
+    video_files = []  # dicts with has_video=True
+    audio_files = []  # dicts with has_video=False (audio-only)
+    skipped = 0
+    errors = []
+
+    for f in all_files:
+        if not f['valid']:
+            skipped += 1
+            errors.append(f'Corrupt/invalid: {f["path"]}')
+            continue
+        if f['has_video']:
+            video_files.append(f)
+        else:
+            audio_files.append(f)
+
+    if skipped:
+        logging.warning(f'Skipped {skipped} corrupt/invalid files')
+    logging.info(f'Segments: {len(video_files)} video, {len(audio_files)} audio-only')
+
+    if not video_files:
+        raise ValueError('No valid video segments found.')
+
+    # Determine target resolution
+    target_w, target_h, target_pix_fmt = 0, 0, 'yuv420p'
+    for f in video_files:
+        if f['width'] * f['height'] > target_w * target_h:
+            target_w, target_h, target_pix_fmt = f['width'], f['height'], f['pix_fmt']
+    if target_w * target_h < 640 * 360:
+        target_w, target_h = 640, 360
+    MAX_H = 720
+    if target_h > MAX_H:
+        target_w = int(target_w * MAX_H / target_h)
+        target_w -= target_w % 2
+        target_h = MAX_H
+    logging.info(f'Target resolution: {target_w}x{target_h}, pix_fmt={target_pix_fmt}')
+
+    # Detect overlaps using cached durations
+    has_overlaps = False
+    for i in range(1, len(video_files)):
+        prev_end = video_files[i-1]['start_time'] + video_files[i-1]['duration']
+        if video_files[i]['start_time'] < prev_end - 0.5:
+            has_overlaps = True
+            break
+
+    # Decide overlap strategy and build segment plan
+    overlap_strategy = 'none'
+    kept_video = []  # files to use as video segments
+    extra_audio = []  # webcam files dropped but with audio to extract
+
+    if has_overlaps and slide_events:
+        overlap_strategy = 'dedup'
+        # Use _deduplicate_overlapping with our probed data
+        vf_tuples = [(f['path'], f['start_time'], f.get('conf_id'),
+                       f.get('is_admin', False)) for f in video_files]
+        deduped = _deduplicate_overlapping(vf_tuples)
+        kept_paths = {v[0] for v in deduped}
+
+        # Map back to file info dicts
+        dedup_map = {f['path']: f for f in video_files}
+        for path, start_time in deduped:
+            if path in dedup_map:
+                kept_video.append(dedup_map[path])
+
+        # Find dropped webcams with audio
+        for f in video_files:
+            if f['path'] not in kept_paths and f['has_audio']:
+                extra_audio.append(f)
+
+        logging.info(f'Dedup: kept {len(kept_video)}, '
+                     f'{len(extra_audio)} extra audio from webcams')
+    elif has_overlaps:
+        overlap_strategy = 'grid'
+        # Grid handled in execute phase (needs ffmpeg)
+        kept_video = video_files  # pass all through
+    else:
+        vf_tuples = [(f['path'], f['start_time'], f.get('conf_id'),
+                       f.get('is_admin', False)) for f in video_files]
+        deduped = _deduplicate_overlapping(vf_tuples)
+        dedup_map = {f['path']: f for f in video_files}
+        for path, start_time in deduped:
+            if path in dedup_map:
+                kept_video.append(dedup_map[path])
+
+    # Build segment plan (gaps + video segments in order)
+    segments = []
+    current_time = 0.0
+    for i, f in enumerate(kept_video):
+        start_time = f['start_time']
+
+        if start_time < current_time - 0.5:
+            errors.append(f'Segment {i} overlaps at {start_time:.1f}s (current={current_time:.1f}s)')
+            continue
+
+        gap = start_time - current_time
+        if gap > 0.1:
+            segments.append({
+                'type': 'gap',
+                'duration': gap,
+                'start_time': current_time,
+            })
+
+        # Compute max duration (truncate at next segment)
+        max_dur = 0
+        for j in range(i + 1, len(kept_video)):
+            ns = kept_video[j]['start_time']
+            if ns > start_time + 0.5:
+                max_dur = ns - start_time
+                break
+
+        segments.append({
+            'type': 'video',
+            'source_path': f['path'],
+            'start_time': start_time,
+            'duration': f['duration'],
+            'max_duration': max_dur,
+            'has_audio': f['has_audio'],
+        })
+
+        if max_dur > 0:
+            current_time = start_time + max_dur
+        else:
+            current_time = start_time + f['duration']
+
+    # Trailing gap
+    if current_time < total_duration - 0.1:
+        segments.append({
+            'type': 'gap',
+            'duration': total_duration - current_time,
+            'start_time': current_time,
+        })
+
+    # Audio merge plan
+    all_audio = [{'path': f['path'], 'start_time': f['start_time'],
+                  'origin': 'original'} for f in audio_files]
+    for f in extra_audio:
+        all_audio.append({
+            'path': f['path'],
+            'start_time': f['start_time'],
+            'origin': 'webcam_extract',
+        })
+
+    # Slide compositing plan
+    slide_plan = None
+    if slide_events:
+        CHUNK_SECS = 1800
+        n_chunks = max(1, int(total_duration + CHUNK_SECS - 1) // CHUNK_SECS)
+        slide_plan = {
+            'events': slide_events,
+            'chunk_seconds': CHUNK_SECS,
+            'num_chunks': n_chunks,
+        }
+
+    # GPU detection
+    _detect_gpu()
+    gpu = {
+        'nvenc': bool(_NVENC_AVAILABLE),
+        'cuda_overlay': bool(_CUDA_OVERLAY_AVAILABLE),
+    }
+
+    manifest = {
+        'version': 1,
+        'total_duration': total_duration,
+        'directory': directory,
+        'output_path': output_path,
+        'max_duration': max_duration,
+        'target': {
+            'width': target_w,
+            'height': target_h,
+            'pix_fmt': target_pix_fmt,
+        },
+        'overlap_strategy': overlap_strategy,
+        'segments': segments,
+        'audio_tracks': all_audio,
+        'slide_compositing': slide_plan,
+        'gpu': gpu,
+        'errors': errors,
+        'warnings': [],
+        'stats': {
+            'total_files': len(all_files),
+            'video_files': len(video_files),
+            'audio_files': len(audio_files),
+            'kept_video': len(kept_video),
+            'extra_audio': len(extra_audio),
+            'skipped': skipped,
+            'segments': len(segments),
+            'gaps': sum(1 for s in segments if s['type'] == 'gap'),
+        },
+    }
+
+    # Write manifest
+    manifest_path = os.path.join(directory, 'manifest.json')
+    with open(manifest_path, 'w') as f:
+        json.dump(manifest, f, indent=2, ensure_ascii=False)
+    logging.info(f'Manifest written to {manifest_path}')
+    logging.info(f'Plan: {manifest["stats"]["segments"]} segments '
+                 f'({manifest["stats"]["gaps"]} gaps), '
+                 f'{len(all_audio)} audio tracks, '
+                 f'strategy={overlap_strategy}')
+
+    if errors:
+        for e in errors:
+            logging.warning(f'Analyze: {e}')
+
+    return manifest
+
+
+def execute_video(manifest: dict):
+    """Phase 2: Execute the plan from the manifest. No probing, no decisions."""
+    logging.info('Phase 2: Executing plan...')
+
+    directory = manifest['directory']
+    output_path = manifest['output_path']
+    total_duration = manifest['total_duration']
+    target = manifest['target']
+    target_w, target_h = target['width'], target['height']
+    target_pix_fmt = target['pix_fmt']
+
+    tmp_dir = os.path.join(directory, '_tmp_ffmpeg')
+    os.makedirs(tmp_dir, exist_ok=True)
+
+    # Step 1: Extract audio from dropped webcam files
+    audio_files = []  # (path, start_time) for merge step
+    extra_dir = os.path.join(tmp_dir, 'extra_audio')
+    os.makedirs(extra_dir, exist_ok=True)
+    extract_count = 0
+    for track in manifest['audio_tracks']:
+        if track['origin'] == 'webcam_extract':
+            audio_path = os.path.join(extra_dir, f'extra_{extract_count}.m4a')
+            try:
+                _run_ffmpeg(
+                    ['ffmpeg', '-y', '-v', 'error',
+                     '-i', track['path'], '-vn',
+                     '-c:a', 'aac', '-b:a', '128k',
+                     '-ar', '44100', '-ac', '2',
+                     audio_path],
+                    description=f'extract audio from webcam {extract_count}',
+                )
+                audio_files.append((audio_path, track['start_time']))
+                extract_count += 1
+            except subprocess.CalledProcessError:
+                logging.warning(f'Failed to extract audio from {track["path"]}')
+        else:
+            audio_files.append((track['path'], track['start_time']))
+    if extract_count:
+        logging.info(f'Extracted audio from {extract_count} webcam files')
+
+    # Step 2: Handle grid layout if needed (requires ffmpeg)
+    segments = manifest['segments']
+    if manifest['overlap_strategy'] == 'grid':
+        # Grid needs full video_files — rebuild from manifest
+        # For now, pass through to the old grid function
+        logging.info('Grid layout — using legacy grid builder')
+        vf_tuples = []
+        for seg in segments:
+            if seg['type'] == 'video':
+                vf_tuples.append((seg['source_path'], seg['start_time']))
+        video_files = _build_grid_segments(
+            [(p, s, None, False) for p, s in vf_tuples],
+            tmp_dir, target_w, target_h, total_duration,
+        )
+        # Rebuild segments from grid output
+        segments = []
+        current_time = 0.0
+        for vpath, start_time in video_files:
+            gap = start_time - current_time
+            if gap > 0.1:
+                segments.append({'type': 'gap', 'duration': gap,
+                                 'start_time': current_time})
+            segments.append({
+                'type': 'video', 'source_path': vpath,
+                'start_time': start_time,
+                'duration': _get_duration(vpath),
+                'max_duration': 0, 'has_audio': True,
+            })
+            current_time = start_time + _get_duration(vpath)
+
+    # Step 3: Normalize segments and generate gaps
+    concat_segments = []
+    for i, seg in enumerate(segments):
+        if seg['type'] == 'gap':
+            gap_path = os.path.join(tmp_dir, f'gap_{i}.mp4')
+            _generate_black_segment(gap_path, seg['duration'],
+                                    target_w, target_h, target_pix_fmt)
+            concat_segments.append(gap_path)
+            logging.info(f'Generated {seg["duration"]:.1f}s black gap')
+        elif seg['type'] == 'video':
+            norm_path = os.path.join(tmp_dir, f'norm_{i}.mp4')
+            _normalize_segment(seg['source_path'], norm_path,
+                               target_w, target_h, target_pix_fmt,
+                               max_duration=seg.get('max_duration', 0))
+            with_audio_path = os.path.join(tmp_dir, f'norma_{i}.mp4')
+            final_seg = _ensure_audio_stream(norm_path, with_audio_path)
+            concat_segments.append(final_seg)
+
+    # Step 4: Concatenate
+    concat_list_path = os.path.join(tmp_dir, 'concat.txt')
+    with open(concat_list_path, 'w') as f:
+        for seg in concat_segments:
+            f.write(f"file '{os.path.abspath(seg)}'\n")
+
+    video_only_path = os.path.join(tmp_dir, 'video_concat.mp4')
+    logging.info(f'Concatenating {len(concat_segments)} segments...')
+
+    cap = manifest.get('max_duration') or total_duration
+    concat_cmd = [
+        'ffmpeg', '-y', '-v', 'warning',
+        '-f', 'concat', '-safe', '0',
+        '-i', concat_list_path,
+        '-c', 'copy',
+    ]
+    if cap:
+        concat_cmd.extend(['-t', str(cap)])
+    concat_cmd.append(video_only_path)
+    _run_ffmpeg(concat_cmd, description=f'concat {len(concat_segments)} segments')
+
+    # Step 5: Composite slides
+    slide_plan = manifest.get('slide_compositing')
+    if slide_plan and slide_plan.get('events'):
+        composited_path = os.path.join(tmp_dir, 'video_composited.mp4')
+        _composite_slides(
+            video_only_path, slide_plan['events'], composited_path,
+            tmp_dir, total_duration,
+        )
+        video_only_path = composited_path
+
+    # Step 6: Merge audio
+    if audio_files:
+        logging.info(f'Merging {len(audio_files)} audio tracks...')
+        result_path = _merge_audio_tracks(
+            video_only_path, audio_files, tmp_dir, output_path,
+            total_duration,
+        )
+    else:
+        shutil.move(video_only_path, output_path)
+        result_path = output_path
+
+    # Cleanup
+    shutil.rmtree(tmp_dir, ignore_errors=True)
+    logging.info(f'Final video saved to {result_path}')
+    return result_path
+
+
 def compile_final_video(
     total_duration: float,
     downloaded_files: List[Tuple[str, float]],
@@ -1138,229 +1565,12 @@ def compile_final_video(
     max_duration: Union[int, None],
     slide_events: List[Dict] = None,
 ):
-    """Concatenate downloaded segments using ffmpeg (no MoviePy re-encoding).
-
-    Steps:
-      1. Separate video and audio-only files.
-      2. Normalize video segments to a common resolution.
-      3. Generate black gap segments where needed.
-      4. Concatenate with ffmpeg concat demuxer (-c copy).
-      5. Merge audio-only tracks on top (in batches to avoid OOM).
-    """
-    _check_ffmpeg()
-
-    video_files = []  # (path, start_time, conf_id, is_admin)
-    audio_files = []  # (path, start_time)
-    skipped = 0
-
-    for item in downloaded_files:
-        file_path, start_time = item[0], item[1]
-        conf_id = item[2] if len(item) > 2 else None
-        is_admin = item[3] if len(item) > 3 else False
-        if not _is_valid_media(file_path):
-            skipped += 1
-            continue
-        if _has_video_stream(file_path):
-            video_files.append((file_path, start_time, conf_id, is_admin))
-        else:
-            audio_files.append((file_path, start_time))
-
-    if skipped:
-        logging.warning(f'Skipped {skipped} corrupt/invalid files')
-    logging.info(f'Segments: {len(video_files)} video, {len(audio_files)} audio-only')
-
-    if not video_files:
-        logging.error('No video segments found.')
-        return
-
-    # Determine target resolution from the first video segment
-    # Pick the largest resolution among video segments (some may be tiny thumbnails)
-    target_w, target_h, target_pix_fmt = 0, 0, 'yuv420p'
-    for vpath, *_ in video_files:
-        w, h, pf = _get_video_params(vpath)
-        if w * h > target_w * target_h:
-            target_w, target_h, target_pix_fmt = w, h, pf
-    # Minimum 640x360 for reasonable quality
-    if target_w * target_h < 640 * 360:
-        target_w, target_h = 640, 360
-    # Cap at 720p to avoid excessive memory use
-    MAX_H = 720
-    if target_h > MAX_H:
-        target_w = int(target_w * MAX_H / target_h)
-        target_w -= target_w % 2  # keep even
-        target_h = MAX_H
-    logging.info(f'Target resolution: {target_w}x{target_h}, pix_fmt={target_pix_fmt}')
-
-    # Sort by start time
-    video_files.sort(key=lambda x: x[1])
-
-    # Build the list of segments (normalized videos + gap fillers)
-    tmp_dir = os.path.join(directory, '_tmp_ffmpeg')
-    os.makedirs(tmp_dir, exist_ok=True)
-
-    # Check for overlapping segments (multiple concurrent webcams)
-    has_overlaps = False
-    annotated_check = sorted(
-        [(item[0], item[1], _get_duration(item[0])) for item in video_files],
-        key=lambda x: x[1],
+    """Two-phase video compilation: analyze then execute."""
+    manifest = analyze_video(
+        total_duration, downloaded_files, directory, output_path,
+        max_duration, slide_events,
     )
-    for i in range(1, len(annotated_check)):
-        prev_end = annotated_check[i-1][1] + annotated_check[i-1][2]
-        if annotated_check[i][1] < prev_end - 0.5:
-            has_overlaps = True
-            break
-
-    if has_overlaps and slide_events:
-        # Keep admin webcam, move other webcam audio to audio_files
-        logging.info('Multiple concurrent webcams + slides, keeping admin webcam')
-        deduped = _deduplicate_overlapping(video_files)
-        # Find webcam files that were dropped — extract their audio for mixing
-        kept_paths = {v[0] for v in deduped}
-        extra_dir = os.path.join(tmp_dir, 'extra_audio')
-        os.makedirs(extra_dir, exist_ok=True)
-        extra_audio = 0
-        for vpath, start_time, *_ in video_files:
-            if vpath not in kept_paths:
-                info = _ffprobe_streams(vpath)
-                has_audio = any(
-                    s.get('codec_type') == 'audio' for s in info.get('streams', [])
-                )
-                if has_audio:
-                    # Extract audio only (strip video) so amix works cleanly
-                    audio_path = os.path.join(extra_dir, f'extra_{extra_audio}.m4a')
-                    try:
-                        _run_ffmpeg(
-                            ['ffmpeg', '-y', '-v', 'error',
-                             '-i', vpath, '-vn',
-                             '-c:a', 'aac', '-b:a', '128k',
-                             '-ar', '44100', '-ac', '2',
-                             audio_path],
-                            description=f'extract audio from webcam {extra_audio}',
-                        )
-                        audio_files.append((audio_path, start_time))
-                        extra_audio += 1
-                    except subprocess.CalledProcessError:
-                        pass  # skip files that fail extraction
-        logging.info(f'Added {extra_audio} webcam audio tracks to mix')
-        video_files = deduped
-    elif has_overlaps:
-        # Grid layout: composite all concurrent webcams into a grid
-        logging.info('Multiple concurrent webcams detected, building grid layout')
-        video_files = _build_grid_segments(
-            video_files, tmp_dir, target_w, target_h, total_duration,
-        )
-    else:
-        video_files = _deduplicate_overlapping(video_files)
-    logging.info(f'After dedup/grid/speaker: {len(video_files)} segments')
-
-    concat_segments = []
-    current_time = 0.0
-
-    for i, (vpath, start_time) in enumerate(video_files):
-        # Skip segments whose start_time is before current_time (overlap)
-        if start_time < current_time - 0.5:
-            logging.warning(
-                f'Segment {i} starts at {start_time:.1f}s but current_time '
-                f'is {current_time:.1f}s — skipping overlapping segment'
-            )
-            continue
-
-        # Insert black gap if needed
-        gap = start_time - current_time
-        if gap > 0.1:  # skip tiny gaps < 100ms
-            gap_path = os.path.join(tmp_dir, f'gap_{i}.mp4')
-            _generate_black_segment(gap_path, gap, target_w, target_h, target_pix_fmt)
-            concat_segments.append(gap_path)
-            logging.info(f'Generated {gap:.1f}s black gap before segment {i}')
-
-        # Compute max allowed duration: truncate if this segment would
-        # overlap the next segment's start_time
-        max_dur = 0  # 0 = no limit
-        next_start = None
-        for j in range(i + 1, len(video_files)):
-            ns = video_files[j][1]
-            if ns > start_time + 0.5:
-                next_start = ns
-                break
-        if next_start is not None:
-            max_dur = next_start - start_time
-
-        # Normalize the segment (with optional truncation)
-        norm_path = os.path.join(tmp_dir, f'norm_{i}.mp4')
-        _normalize_segment(vpath, norm_path, target_w, target_h, target_pix_fmt,
-                           max_duration=max_dur)
-        # Ensure it has an audio stream
-        with_audio_path = os.path.join(tmp_dir, f'norma_{i}.mp4')
-        final_seg = _ensure_audio_stream(norm_path, with_audio_path)
-        concat_segments.append(final_seg)
-
-        # Use intended duration (from timeline) to advance current_time,
-        # not actual file duration which may drift due to re-encoding.
-        if max_dur > 0:
-            current_time = start_time + max_dur
-        elif next_start is not None:
-            current_time = next_start
-        else:
-            # Last segment — use actual duration as fallback
-            seg_dur = _get_duration(final_seg)
-            current_time = start_time + seg_dur
-
-    # Trailing gap
-    if current_time < total_duration - 0.1:
-        gap_path = os.path.join(tmp_dir, 'gap_end.mp4')
-        _generate_black_segment(gap_path, total_duration - current_time,
-                                target_w, target_h, target_pix_fmt)
-        concat_segments.append(gap_path)
-
-    # Write concat list
-    concat_list_path = os.path.join(tmp_dir, 'concat.txt')
-    with open(concat_list_path, 'w') as f:
-        for seg in concat_segments:
-            f.write(f"file '{os.path.abspath(seg)}'\n")
-
-    # Concatenate with ffmpeg concat demuxer (stream copy - no re-encoding)
-    video_only_path = os.path.join(tmp_dir, 'video_concat.mp4')
-    logging.info(f'Concatenating {len(concat_segments)} segments...')
-
-    concat_cmd = [
-        'ffmpeg', '-y', '-v', 'warning',
-        '-f', 'concat', '-safe', '0',
-        '-i', concat_list_path,
-        '-c', 'copy',
-    ]
-
-    # Cap at max_duration or total_duration to prevent inflated output
-    cap = max_duration or total_duration
-    if cap:
-        concat_cmd.extend(['-t', str(cap)])
-
-    concat_cmd.append(video_only_path)
-    _run_ffmpeg(concat_cmd, description=f'concat {len(concat_segments)} segments')
-
-    # Composite slides if presentation data exists
-    if slide_events:
-        composited_path = os.path.join(tmp_dir, 'video_composited.mp4')
-        _composite_slides(
-            video_only_path, slide_events, composited_path,
-            tmp_dir, total_duration,
-        )
-        video_only_path = composited_path
-
-    # If there are audio-only tracks, overlay them
-    if audio_files:
-        logging.info(f'Merging {len(audio_files)} audio-only tracks...')
-        result_path = _merge_audio_tracks(
-            video_only_path, audio_files, tmp_dir, output_path,
-            total_duration,
-        )
-    else:
-        # Just move/copy the result
-        shutil.move(video_only_path, output_path)
-        result_path = output_path
-
-    # Cleanup temp files
-    shutil.rmtree(tmp_dir, ignore_errors=True)
-    logging.info(f'Final video saved to {result_path}')
+    execute_video(manifest)
 
 
 def _merge_audio_tracks(
