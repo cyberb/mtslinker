@@ -1216,9 +1216,18 @@ def compile_final_video(
         deduped = _deduplicate_overlapping(video_files)
         # Find webcam files that were dropped — add their audio to the mix
         kept_paths = {v[0] for v in deduped}
+        extra_audio = 0
         for vpath, start_time, *_ in video_files:
             if vpath not in kept_paths:
-                audio_files.append((vpath, start_time))
+                # Only add if the file has an audio stream
+                info = _ffprobe_streams(vpath)
+                has_audio = any(
+                    s.get('codec_type') == 'audio' for s in info.get('streams', [])
+                )
+                if has_audio:
+                    audio_files.append((vpath, start_time))
+                    extra_audio += 1
+        logging.info(f'Added {extra_audio} webcam audio tracks to mix')
         video_files = deduped
     elif has_overlaps:
         # Grid layout: composite all concurrent webcams into a grid
