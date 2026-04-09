@@ -786,27 +786,55 @@ def process_and_download_clips(
 
     admin_conf_ids = _extract_admin_conf_ids(json_data)
 
+    # Parse mediasession events for precise timing
+    mediasession_adds = {}  # id -> {url, start, conf_id}
     chunks = []
     slide_events = []
     for event in json_data.get('eventLogs', []):
         if not isinstance(event, dict):
             continue
+        module = event.get('module', '')
         data = event.get('data', {})
         if not isinstance(data, dict):
             continue
 
-        # Media chunks (video/audio)
-        if 'url' in data:
+        # mediasession.add: precise file start time
+        if module == 'mediasession.add' and 'url' in data:
+            ms_id = data.get('id')
             stream = data.get('stream', {})
             conf_id = None
             if isinstance(stream, dict):
                 conf = stream.get('conference', {})
                 if isinstance(conf, dict):
                     conf_id = conf.get('id')
-            chunks.append((data['url'], event.get('relativeTime', 0), conf_id))
+            mediasession_adds[ms_id] = {
+                'url': data['url'],
+                'start': event.get('relativeTime', 0),
+                'conf_id': conf_id,
+                'api_duration': 0,
+            }
+
+        # mediasession.update: duration
+        if module == 'mediasession.update':
+            ms_id = data.get('id')
+            if ms_id in mediasession_adds:
+                mediasession_adds[ms_id]['api_duration'] = data.get('duration', 0)
+
+        # Fallback: any event with URL (catches non-mediasession chunks)
+        elif 'url' in data and module not in ('mediasession.add',):
+            stream = data.get('stream', {})
+            conf_id = None
+            if isinstance(stream, dict):
+                conf = stream.get('conference', {})
+                if isinstance(conf, dict):
+                    conf_id = conf.get('id')
+            # Only add if not already in mediasession_adds
+            url = data['url']
+            if not any(ms['url'] == url for ms in mediasession_adds.values()):
+                chunks.append((url, event.get('relativeTime', 0), conf_id, 0))
 
         # Presentation slide changes
-        if event.get('module') == 'presentation.update':
+        if module == 'presentation.update':
             fr = data.get('fileReference', {})
             if not isinstance(fr, dict):
                 continue
@@ -820,10 +848,16 @@ def process_and_download_clips(
                 'slide_url': slide_url,
             })
 
-    # Tag chunks from admin conferences for dedup priority
+    # Build tagged chunks from mediasession data (preferred) + fallback chunks
     tagged_chunks = []
-    for url, start, conf_id in chunks:
-        tagged_chunks.append((url, start, conf_id, conf_id in admin_conf_ids))
+    for ms in mediasession_adds.values():
+        tagged_chunks.append((
+            ms['url'], ms['start'], ms['conf_id'],
+            ms['conf_id'] in admin_conf_ids,
+            ms['api_duration'],
+        ))
+    for url, start, conf_id, api_dur in chunks:
+        tagged_chunks.append((url, start, conf_id, conf_id in admin_conf_ids, api_dur))
 
     # Deduplicate consecutive identical slides
     deduped_slides = []
@@ -1175,20 +1209,24 @@ def _probe_all_files(downloaded_files: list) -> List[dict]:
     results = []
     paths = [(item[0], item[1],
               item[2] if len(item) > 2 else None,
-              item[3] if len(item) > 3 else False)
+              item[3] if len(item) > 3 else False,
+              item[4] if len(item) > 4 else 0)
              for item in downloaded_files]
 
     with ThreadPoolExecutor(max_workers=8) as pool:
         futures = {}
-        for path, start_time, conf_id, is_admin in paths:
+        for path, start_time, conf_id, is_admin, api_duration in paths:
             fut = pool.submit(_probe_file, path)
-            futures[fut] = (start_time, conf_id, is_admin)
+            futures[fut] = (start_time, conf_id, is_admin, api_duration)
         for fut in as_completed(futures):
-            start_time, conf_id, is_admin = futures[fut]
+            start_time, conf_id, is_admin, api_duration = futures[fut]
             info = fut.result()
             info['start_time'] = start_time
             info['conf_id'] = conf_id
             info['is_admin'] = is_admin
+            # Use API duration if available (more accurate than ffprobe)
+            if api_duration > 0:
+                info['api_duration'] = api_duration
             results.append(info)
 
     results.sort(key=lambda x: x['start_time'])
@@ -1254,7 +1292,8 @@ def analyze_video(
     # Detect overlaps using cached durations
     has_overlaps = False
     for i in range(1, len(video_files)):
-        prev_end = video_files[i-1]['start_time'] + video_files[i-1]['duration']
+        prev_dur = video_files[i-1].get('api_duration', 0) or video_files[i-1]['duration']
+        prev_end = video_files[i-1]['start_time'] + prev_dur
         if video_files[i]['start_time'] < prev_end - 0.5:
             has_overlaps = True
             break
@@ -1290,9 +1329,11 @@ def analyze_video(
         overlap_strategy = 'grid'
         # Plan grid windows using probed durations
         # Build annotated list: (path, start, duration, end)
-        annotated = [(f['path'], f['start_time'], f['duration'],
-                      f['start_time'] + f['duration'], f['has_audio'])
-                     for f in video_files]
+        annotated = []
+        for f in video_files:
+            dur = f.get('api_duration', 0) or f['duration']
+            annotated.append((f['path'], f['start_time'], dur,
+                              f['start_time'] + dur, f['has_audio']))
         # Collect all event times
         event_times_set = set()
         for _, start, _, end, _ in annotated:
@@ -1394,7 +1435,8 @@ def analyze_video(
                 break
 
         # planned_duration = how long this segment should be in the output
-        planned_dur = max_dur if max_dur > 0 else f['duration']
+        file_dur = f.get('api_duration', 0) or f['duration']
+        planned_dur = max_dur if max_dur > 0 else file_dur
         segments.append({
             'type': 'video',
             'source_path': f['path'],
