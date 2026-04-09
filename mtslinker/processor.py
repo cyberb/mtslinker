@@ -587,16 +587,16 @@ def _composite_grid(
         + f'xstack=inputs={total_cells}:layout={layout}[out]'
     )
 
-    # Audio is handled separately by _merge_audio_tracks — output video only.
+    # Include audio from first input if available (? = optional)
     cmd = [
         'ffmpeg', '-y', '-v', 'error',
         *inputs,
         '-t', str(duration),
         '-filter_complex', filter_graph,
-        '-map', '[out]',
-        '-an',
+        '-map', '[out]', '-map', '0:a?',
         *_get_video_encoder_fast(),
         '-pix_fmt', 'yuv420p',
+        '-c:a', 'aac', '-b:a', '128k', '-ar', '44100', '-ac', '2',
         '-r', '25',
         output_path,
     ]
@@ -1291,7 +1291,8 @@ def analyze_video(
         # Plan grid windows using probed durations
         # Build annotated list: (path, start, duration, end)
         annotated = [(f['path'], f['start_time'], f['duration'],
-                      f['start_time'] + f['duration']) for f in video_files]
+                      f['start_time'] + f['duration'], f['has_audio'])
+                     for f in video_files]
         # Collect all event times
         event_times_set = set()
         for _, start, _, end in annotated:
@@ -1311,13 +1312,14 @@ def analyze_video(
             if t_end - t_start < 0.1:
                 continue
             active = []
-            for path, seg_start, dur, seg_end in annotated:
+            for path, seg_start, dur, seg_end, has_audio in annotated:
                 if seg_start < t_end and seg_end > t_start:
                     offset = max(0, t_start - seg_start)
                     remaining = dur - offset
-                    if remaining > 0.5:  # only include if >0.5s remaining
+                    if remaining > 0.5:
                         active.append({'path': path, 'offset': offset,
-                                       'remaining': remaining})
+                                       'remaining': remaining,
+                                       'has_audio': has_audio})
             active_key = tuple(a['path'] for a in active)
             if active_key == prev_active_key and window_start is not None:
                 continue
@@ -1562,7 +1564,10 @@ def execute_video(manifest: dict):
             os.makedirs(grid_dir, exist_ok=True)
             seg_path = os.path.join(grid_dir, f'grid_{i}.mp4')
             duration = seg['planned_duration']
-            active = [(s['path'], s['offset']) for s in seg['sources']]
+            # Sort sources: audio-bearing first so input 0 has audio
+            sources = sorted(seg['sources'],
+                             key=lambda s: not s.get('has_audio', False))
+            active = [(s['path'], s['offset']) for s in sources]
             try:
                 if len(active) == 1:
                     path, offset = active[0]
