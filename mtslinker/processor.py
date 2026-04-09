@@ -1451,9 +1451,24 @@ def analyze_video(
 
         current_time = start_time + planned_dur
 
+    # For grid: fill timeline gaps so video matches audio timeline exactly
+    if overlap_strategy == 'grid' and segments:
+        filled = []
+        current_time = 0.0
+        for s in segments:
+            start = s.get('start_time', 0)
+            if start - current_time > 0.1:
+                filled.append({
+                    'type': 'gap',
+                    'duration': start - current_time,
+                    'start_time': current_time,
+                })
+            filled.append(s)
+            current_time = start + s.get('planned_duration', s.get('duration', 0))
+        segments = filled
+
     # Trailing gap — extend video to total_duration so audio can play over black
     if overlap_strategy == 'grid':
-        # For grid, compute current_time from segments
         current_time = 0
         for s in segments:
             end = s.get('start_time', 0) + s.get('planned_duration', s.get('duration', 0))
