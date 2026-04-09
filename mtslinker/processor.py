@@ -1295,7 +1295,7 @@ def analyze_video(
                      for f in video_files]
         # Collect all event times
         event_times_set = set()
-        for _, start, _, end in annotated:
+        for _, start, _, end, _ in annotated:
             event_times_set.add(start)
             event_times_set.add(end)
         event_times_set.add(total_duration)
