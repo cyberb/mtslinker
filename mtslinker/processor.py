@@ -1263,6 +1263,7 @@ def analyze_video(
     overlap_strategy = 'none'
     kept_video = []  # files to use as video segments
     extra_audio = []  # webcam files dropped but with audio to extract
+    segments = []  # populated by grid, or built later for dedup/none
 
     if has_overlaps and slide_events:
         overlap_strategy = 'dedup'
@@ -1287,8 +1288,72 @@ def analyze_video(
                      f'{len(extra_audio)} extra audio from webcams')
     elif has_overlaps:
         overlap_strategy = 'grid'
-        # Grid handled in execute phase (needs ffmpeg)
-        kept_video = video_files  # pass all through
+        # Plan grid windows using probed durations
+        # Build annotated list: (path, start, duration, end)
+        annotated = [(f['path'], f['start_time'], f['duration'],
+                      f['start_time'] + f['duration']) for f in video_files]
+        # Collect all event times
+        event_times_set = set()
+        for _, start, _, end in annotated:
+            event_times_set.add(start)
+            event_times_set.add(end)
+        event_times_set.add(total_duration)
+        event_times = sorted(event_times_set)
+
+        # Build grid windows with validated sources
+        grid_windows = []
+        prev_active_key = None
+        window_start = None
+        window_active = None
+        for ei in range(len(event_times) - 1):
+            t_start = event_times[ei]
+            t_end = event_times[ei + 1]
+            if t_end - t_start < 0.1:
+                continue
+            active = []
+            for path, seg_start, dur, seg_end in annotated:
+                if seg_start < t_end and seg_end > t_start:
+                    offset = max(0, t_start - seg_start)
+                    remaining = dur - offset
+                    if remaining > 0.5:  # only include if >0.5s remaining
+                        active.append({'path': path, 'offset': offset,
+                                       'remaining': remaining})
+            active_key = tuple(a['path'] for a in active)
+            if active_key == prev_active_key and window_start is not None:
+                continue
+            if prev_active_key is not None and window_start is not None:
+                grid_windows.append({
+                    'start_time': window_start,
+                    'duration': t_start - window_start,
+                    'sources': window_active,
+                })
+            window_start = t_start
+            prev_active_key = active_key
+            window_active = active
+        if window_start is not None and window_active:
+            grid_windows.append({
+                'start_time': window_start,
+                'duration': event_times[-1] - window_start,
+                'sources': window_active,
+            })
+
+        # Convert grid windows to segments
+        for gw in grid_windows:
+            if not gw['sources']:
+                segments.append({
+                    'type': 'gap',
+                    'duration': gw['duration'],
+                    'start_time': gw['start_time'],
+                })
+            else:
+                segments.append({
+                    'type': 'grid',
+                    'start_time': gw['start_time'],
+                    'planned_duration': gw['duration'],
+                    'sources': gw['sources'],
+                })
+        # No extra audio extraction for grid (audio handled by merge)
+        # kept_video not used for grid — segments has everything
     else:
         vf_tuples = [(f['path'], f['start_time'], f.get('conf_id'),
                        f.get('is_admin', False)) for f in video_files]
@@ -1299,7 +1364,9 @@ def analyze_video(
                 kept_video.append(dedup_map[path])
 
     # Build segment plan (gaps + video segments in order)
-    segments = []
+    # Grid strategy already has segments populated
+    if overlap_strategy != 'grid':
+        segments = []
     current_time = 0.0
     for i, f in enumerate(kept_video):
         start_time = f['start_time']
@@ -1340,8 +1407,8 @@ def analyze_video(
 
         current_time = start_time + planned_dur
 
-    # Trailing gap
-    if current_time < total_duration - 0.1:
+    # Trailing gap (not for grid — grid segments already cover full timeline)
+    if overlap_strategy != 'grid' and current_time < total_duration - 0.1:
         segments.append({
             'type': 'gap',
             'duration': total_duration - current_time,
@@ -1480,37 +1547,9 @@ def execute_video(manifest: dict):
     if extract_count:
         logging.info(f'Extracted audio from {extract_count} webcam files')
 
-    # Step 2: Handle grid layout if needed (requires ffmpeg)
+    # Step 2: Process segments
     segments = manifest['segments']
-    if manifest['overlap_strategy'] == 'grid':
-        # Grid needs full video_files — rebuild from manifest
-        # For now, pass through to the old grid function
-        logging.info('Grid layout — using legacy grid builder')
-        vf_tuples = []
-        for seg in segments:
-            if seg['type'] == 'video':
-                vf_tuples.append((seg['source_path'], seg['start_time']))
-        video_files = _build_grid_segments(
-            [(p, s, None, False) for p, s in vf_tuples],
-            tmp_dir, target_w, target_h, total_duration,
-        )
-        # Rebuild segments from grid output
-        segments = []
-        current_time = 0.0
-        for vpath, start_time in video_files:
-            gap = start_time - current_time
-            if gap > 0.1:
-                segments.append({'type': 'gap', 'duration': gap,
-                                 'start_time': current_time})
-            segments.append({
-                'type': 'video', 'source_path': vpath,
-                'start_time': start_time,
-                'duration': _get_duration(vpath),
-                'max_duration': 0, 'has_audio': True,
-            })
-            current_time = start_time + _get_duration(vpath)
-
-    # Step 3: Normalize segments and generate gaps
+    grid_dir = os.path.join(tmp_dir, 'grid_segments')
     concat_segments = []
     for i, seg in enumerate(segments):
         if seg['type'] == 'gap':
@@ -1519,6 +1558,36 @@ def execute_video(manifest: dict):
                                     target_w, target_h, target_pix_fmt)
             concat_segments.append(gap_path)
             logging.info(f'Generated {seg["duration"]:.1f}s black gap')
+        elif seg['type'] == 'grid':
+            os.makedirs(grid_dir, exist_ok=True)
+            seg_path = os.path.join(grid_dir, f'grid_{i}.mp4')
+            duration = seg['planned_duration']
+            active = [(s['path'], s['offset']) for s in seg['sources']]
+            try:
+                if len(active) == 1:
+                    path, offset = active[0]
+                    _run_ffmpeg(
+                        ['ffmpeg', '-y', '-v', 'error',
+                         '-ss', str(offset), '-i', path,
+                         '-t', str(duration),
+                         '-vf', f'scale={target_w}:{target_h}:force_original_aspect_ratio=decrease,'
+                                f'pad={target_w}:{target_h}:(ow-iw)/2:(oh-ih)/2:black,setsar=1',
+                         *_get_video_encoder_fast(), '-pix_fmt', 'yuv420p',
+                         '-c:a', 'aac', '-b:a', '128k', '-ar', '44100', '-ac', '2',
+                         '-r', '25', seg_path],
+                        description=f'grid {i} (1 webcam, {duration:.0f}s)',
+                    )
+                else:
+                    _composite_grid(active, duration, seg_path, target_w, target_h)
+                with_audio = os.path.join(tmp_dir, f'grida_{i}.mp4')
+                final_seg = _ensure_audio_stream(seg_path, with_audio)
+                concat_segments.append(final_seg)
+            except subprocess.CalledProcessError:
+                logging.warning(f'Grid segment {i} failed, using black gap')
+                gap_path = os.path.join(tmp_dir, f'gridfail_{i}.mp4')
+                _generate_black_segment(gap_path, duration,
+                                        target_w, target_h, target_pix_fmt)
+                concat_segments.append(gap_path)
         elif seg['type'] == 'video':
             norm_path = os.path.join(tmp_dir, f'norm_{i}.mp4')
             _normalize_segment(seg['source_path'], norm_path,
