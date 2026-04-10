@@ -24,7 +24,7 @@ def fetch_webinar_data(event_sessions: str, record_id: str, session_id=None, max
     directory = create_directory_if_not_exists(sanitized_name)
     output_video_path = os.path.join(directory, f'{sanitized_name}.mp4')
 
-    total_duration, chunks, slide_events = process_and_download_clips(directory, json_data)
+    total_duration, chunks, slide_events, timeline = process_and_download_clips(directory, json_data)
     logging.info(f'Found {len(chunks)} chunks to download ({total_duration} sec total)')
 
     # Download all chunks in parallel
@@ -38,7 +38,7 @@ def fetch_webinar_data(event_sessions: str, record_id: str, session_id=None, max
 
     compile_final_video(
         total_duration, downloaded_files, directory, output_video_path,
-        max_duration, slide_events=downloaded_slides,
+        max_duration, slide_events=downloaded_slides, timeline=timeline,
     )
     logging.info(f'Final video saved to {output_video_path}')
 

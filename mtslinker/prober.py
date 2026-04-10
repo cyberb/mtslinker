@@ -1,8 +1,5 @@
 import json
-import logging
-import os
 import subprocess
-import tempfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import List, Tuple
 
@@ -19,17 +16,6 @@ class MediaProber:
         if result.returncode != 0:
             return {}
         return json.loads(result.stdout)
-
-    def is_valid(self, file_path: str) -> bool:
-        result = subprocess.run(
-            ['ffprobe', '-v', 'error', '-show_entries', 'format=duration',
-             '-of', 'csv=p=0', file_path],
-            capture_output=True, text=True,
-        )
-        if result.returncode != 0:
-            logging.warning(f'Corrupt/invalid file: {file_path}: {result.stderr.strip()[:200]}')
-            return False
-        return True
 
     def has_video(self, file_path: str) -> bool:
         info = self.probe_streams(file_path)
@@ -58,62 +44,6 @@ class MediaProber:
                 pix_fmt = stream.get('pix_fmt', 'yuv420p')
                 return w, h, pix_fmt
         return 1920, 1080, 'yuv420p'
-
-    def is_silent(self, file_path: str, threshold: float = -88.0) -> bool:
-        result = subprocess.run(
-            ['ffmpeg', '-v', 'error', '-i', file_path,
-             '-t', '10', '-af', 'volumedetect', '-f', 'null', '-'],
-            capture_output=True, text=True,
-        )
-        for line in result.stderr.splitlines():
-            if 'mean_volume' in line:
-                try:
-                    vol = float(line.split('mean_volume:')[1].strip().split()[0])
-                    return vol < threshold
-                except (ValueError, IndexError):
-                    pass
-        return True
-
-    def analyze_audio_levels(self, file_path: str, window_sec: float = 2.0,
-                             sample_rate: int = 44100) -> List[Tuple[float, float]]:
-        reset_samples = int(sample_rate * window_sec)
-        with tempfile.NamedTemporaryFile(suffix='.txt', delete=False) as tmp:
-            tmp_path = tmp.name
-        try:
-            result = subprocess.run(
-                ['ffmpeg', '-v', 'error', '-i', file_path,
-                 '-af', f'astats=metadata=1:reset={reset_samples},'
-                        f'ametadata=print:key=lavfi.astats.Overall.RMS_level'
-                        f':file={tmp_path}',
-                 '-f', 'null', '-'],
-                capture_output=True, text=True,
-            )
-            if result.returncode != 0:
-                return []
-            levels = []
-            current_time = None
-            with open(tmp_path) as f:
-                for line in f:
-                    line = line.strip()
-                    if line.startswith('frame:'):
-                        for part in line.split():
-                            if part.startswith('pts_time:'):
-                                try:
-                                    current_time = float(part.split(':')[1])
-                                except (ValueError, IndexError):
-                                    pass
-                    elif 'RMS_level' in line and current_time is not None:
-                        try:
-                            val = float(line.split('=')[1])
-                            levels.append((current_time, val))
-                        except (ValueError, IndexError):
-                            pass
-            return levels
-        finally:
-            try:
-                os.remove(tmp_path)
-            except OSError:
-                pass
 
     def probe_file(self, file_path: str) -> dict:
         info = self.probe_streams(file_path)

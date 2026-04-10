@@ -13,9 +13,7 @@ import logging
 import os
 import shutil
 import subprocess
-from collections import defaultdict
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from typing import Dict, List, Tuple, Union
+from typing import List
 
 from mtslinker.ffmpeg import FFmpegRunner
 from mtslinker.prober import MediaProber
@@ -23,6 +21,7 @@ from mtslinker.segments import SegmentBuilder
 from mtslinker.grid import GridCompositor
 from mtslinker.slides import SlideCompositor
 from mtslinker.audio import AudioMerger
+from mtslinker.timeline import StreamTimeline, GridSource, AudioTrack
 
 
 class VideoProcessor:
@@ -37,8 +36,13 @@ class VideoProcessor:
         self.audio = AudioMerger(self.ffmpeg, self.prober)
 
     def analyze(self, total_duration, downloaded_files, directory,
-                output_path, max_duration=None, slide_events=None):
-        """Phase 1: Probe all files, make all decisions, write manifest."""
+                output_path, max_duration=None, slide_events=None,
+                timeline=None):
+        """Phase 1: Probe all files, make all decisions, write manifest.
+
+        Uses the StreamTimeline built from mediasession events as the source
+        of truth — matches what the JS player does.
+        """
         logging.info('Phase 1: Analyzing files...')
 
         all_files = self.prober.probe_all_files(downloaded_files)
@@ -79,211 +83,83 @@ class VideoProcessor:
             target_h = MAX_H
         logging.info(f'Target resolution: {target_w}x{target_h}, pix_fmt={target_pix_fmt}')
 
-        # Detect overlaps
-        has_overlaps = False
-        for i in range(1, len(video_files)):
-            prev_dur = video_files[i-1].get('api_duration', 0) or video_files[i-1]['duration']
-            prev_end = video_files[i-1]['start_time'] + prev_dur
-            if video_files[i]['start_time'] < prev_end - 0.5:
-                has_overlaps = True
-                break
-
-        # Decide strategy and build segment plan
-        overlap_strategy = 'none'
-        kept_video = []
-        extra_audio = []
+        # Build segment plan from timeline (mediasession events).
+        # Each stream gets an independent playback element, all active
+        # streams play simultaneously — no dedup/overlap guessing needed.
         segments = []
+        timeline.map_downloaded_files(downloaded_files)
+        tw_windows = timeline.get_windows_with_files()
+        path_lookup = {f['path']: f for f in video_files}
 
-        if has_overlaps and slide_events:
-            overlap_strategy = 'dedup'
-            vf_tuples = [(f['path'], f['start_time'], f.get('conf_id'),
-                           f.get('is_admin', False)) for f in video_files]
-            deduped = self.segments.deduplicate(vf_tuples)
-            kept_paths = {v[0] for v in deduped}
-
-            dedup_map = {f['path']: f for f in video_files}
-            for path, start_time in deduped:
-                if path in dedup_map:
-                    kept_video.append(dedup_map[path])
-
-            for f in video_files:
-                if f['path'] not in kept_paths and f['has_audio']:
-                    extra_audio.append(f)
-
-            logging.info(f'Dedup: kept {len(kept_video)}, '
-                         f'{len(extra_audio)} extra audio from webcams')
-
-        elif has_overlaps:
-            overlap_strategy = 'grid'
-            annotated = []
-            for f in video_files:
-                dur = f.get('api_duration', 0) or f['duration']
-                annotated.append((f['path'], f['start_time'], dur,
-                                  f['start_time'] + dur, f['has_audio']))
-
-            event_times_set = set()
-            for _, start, _, end, _ in annotated:
-                event_times_set.add(start)
-                event_times_set.add(end)
-            event_times_set.add(total_duration)
-            event_times = sorted(event_times_set)
-
-            grid_windows = []
-            prev_active_key = None
-            window_start = None
-            window_active = None
-            for ei in range(len(event_times) - 1):
-                t_start = event_times[ei]
-                t_end = event_times[ei + 1]
-                if t_end - t_start < 0.1:
+        for tw in tw_windows:
+            sources = []
+            for stream in tw.streams:
+                if not stream.file_path or stream.file_path not in path_lookup:
                     continue
-                active = []
-                for path, seg_start, dur, seg_end, has_audio in annotated:
-                    if seg_start < t_end and seg_end > t_start:
-                        offset = max(0, t_start - seg_start)
-                        remaining = dur - offset
-                        if remaining > 0.5:
-                            active.append({'path': path, 'offset': offset,
-                                           'remaining': remaining,
-                                           'has_audio': has_audio})
-                active_key = tuple(a['path'] for a in active)
-                if active_key == prev_active_key and window_start is not None:
-                    continue
-                if prev_active_key is not None and window_start is not None:
-                    grid_windows.append({
-                        'start_time': window_start,
-                        'duration': t_start - window_start,
-                        'sources': window_active,
-                    })
-                window_start = t_start
-                prev_active_key = active_key
-                window_active = active
-            if window_start is not None and window_active:
-                grid_windows.append({
-                    'start_time': window_start,
-                    'duration': event_times[-1] - window_start,
-                    'sources': window_active,
+                offset = max(0, tw.start_time - stream.start_time)
+                f = path_lookup[stream.file_path]
+                sources.append({
+                    'path': stream.file_path,
+                    'offset': offset,
+                    'remaining': tw.duration,
+                    'has_audio': stream.has_audio and f['has_audio'],
                 })
-
-            for gw in grid_windows:
-                if not gw['sources']:
-                    segments.append({
-                        'type': 'gap',
-                        'duration': gw['duration'],
-                        'start_time': gw['start_time'],
-                    })
-                else:
-                    segments.append({
-                        'type': 'grid',
-                        'start_time': gw['start_time'],
-                        'planned_duration': gw['duration'],
-                        'sources': gw['sources'],
-                    })
-
-            # Grid composite includes audio from input 0 (sorted by has_audio).
-            # Extract audio from OTHER webcams (not input 0) to avoid echo
-            # but still capture all voices.
-            grid_input0_paths = set()
-            for seg in segments:
-                if seg['type'] == 'grid' and seg.get('sources'):
-                    # Input 0 = first source sorted by has_audio (same as execute)
-                    sorted_sources = sorted(seg['sources'],
-                                            key=lambda s: not s.get('has_audio', False))
-                    if sorted_sources:
-                        grid_input0_paths.add(sorted_sources[0]['path'])
-
-            for f in video_files:
-                if f['has_audio'] and f['path'] not in grid_input0_paths:
-                    extra_audio.append(f)
-            if extra_audio:
-                logging.info(f'Grid: {len(extra_audio)} non-primary webcam audio to extract')
-
-        else:
-            vf_tuples = [(f['path'], f['start_time'], f.get('conf_id'),
-                           f.get('is_admin', False)) for f in video_files]
-            deduped = self.segments.deduplicate(vf_tuples)
-            dedup_map = {f['path']: f for f in video_files}
-            for path, start_time in deduped:
-                if path in dedup_map:
-                    kept_video.append(dedup_map[path])
-
-        # Build segment plan for non-grid strategies
-        if overlap_strategy != 'grid':
-            segments = []
-        current_time = 0.0
-        for i, f in enumerate(kept_video):
-            start_time = f['start_time']
-            if start_time < current_time - 0.5:
-                errors.append(f'Segment {i} overlaps at {start_time:.1f}s (current={current_time:.1f}s)')
-                continue
-
-            gap = start_time - current_time
-            if gap > 0.1:
+            if not sources:
                 segments.append({
-                    'type': 'gap', 'duration': gap, 'start_time': current_time,
+                    'type': 'gap',
+                    'duration': tw.duration,
+                    'start_time': tw.start_time,
+                })
+            elif len(sources) == 1:
+                s = sources[0]
+                f = path_lookup[s['path']]
+                segments.append({
+                    'type': 'video',
+                    'source_path': s['path'],
+                    'start_time': tw.start_time,
+                    'source_offset': s['offset'],
+                    'source_duration': f['duration'],
+                    'planned_duration': tw.duration,
+                    'has_audio': s['has_audio'],
+                    'width': f['width'],
+                    'height': f['height'],
+                })
+            else:
+                segments.append({
+                    'type': 'grid',
+                    'start_time': tw.start_time,
+                    'planned_duration': tw.duration,
+                    'sources': sources,
+                    'mix_all_audio': True,
                 })
 
-            max_dur = 0
-            for j in range(i + 1, len(kept_video)):
-                ns = kept_video[j]['start_time']
-                if ns > start_time + 0.5:
-                    max_dur = ns - start_time
-                    break
-
-            file_dur = f.get('api_duration', 0) or f['duration']
-            planned_dur = max_dur if max_dur > 0 else file_dur
-            segments.append({
-                'type': 'video',
-                'source_path': f['path'],
-                'start_time': start_time,
-                'source_duration': f['duration'],
-                'max_duration': max_dur,
-                'planned_duration': planned_dur,
-                'has_audio': f['has_audio'],
-                'width': f['width'],
-                'height': f['height'],
-            })
-            current_time = start_time + planned_dur
-
-        # Fill grid timeline gaps
-        if overlap_strategy == 'grid' and segments:
-            filled = []
-            current_time = 0.0
-            for s in segments:
-                start = s.get('start_time', 0)
-                if start - current_time > 0.1:
-                    filled.append({
-                        'type': 'gap',
-                        'duration': start - current_time,
-                        'start_time': current_time,
-                    })
-                filled.append(s)
-                current_time = start + s.get('planned_duration', s.get('duration', 0))
-            segments = filled
-
-        # Trailing gap
-        if overlap_strategy == 'grid':
-            current_time = 0
-            for s in segments:
-                end = s.get('start_time', 0) + s.get('planned_duration', s.get('duration', 0))
-                if end > current_time:
-                    current_time = end
+        # Fill leading/trailing gaps
+        filled = []
+        current_time = 0.0
+        for s in segments:
+            start = s.get('start_time', 0)
+            if start - current_time > 0.1:
+                filled.append({
+                    'type': 'gap',
+                    'duration': start - current_time,
+                    'start_time': current_time,
+                })
+            filled.append(s)
+            current_time = start + s.get('planned_duration', s.get('duration', 0))
         if current_time < total_duration - 0.1:
-            segments.append({
+            filled.append({
                 'type': 'gap',
                 'duration': total_duration - current_time,
                 'start_time': current_time,
             })
+        segments = filled
 
-        # Audio tracks
+        logging.info(f'Timeline: {len(segments)} segments from mediasession events')
+
+        # Audio tracks — only audio-only files (webcam audio is mixed
+        # inline by GridCompositor, no separate extraction needed)
         all_audio = [{'path': f['path'], 'start_time': f['start_time'],
                       'origin': 'original'} for f in audio_files]
-        for f in extra_audio:
-            all_audio.append({
-                'path': f['path'],
-                'start_time': f['start_time'],
-                'origin': 'webcam_extract',
-            })
 
         # Slide compositing plan
         slide_plan = None
@@ -323,7 +199,7 @@ class VideoProcessor:
             'output_path': output_path,
             'max_duration': max_duration,
             'target': {'width': target_w, 'height': target_h, 'pix_fmt': target_pix_fmt},
-            'overlap_strategy': overlap_strategy,
+            'overlap_strategy': 'timeline',
             'segments': segments,
             'audio_tracks': all_audio,
             'slide_compositing': slide_plan,
@@ -334,8 +210,8 @@ class VideoProcessor:
                 'total_files': len(all_files),
                 'video_files': len(video_files),
                 'audio_files': len(audio_files),
-                'kept_video': len(kept_video),
-                'extra_audio': len(extra_audio),
+                'kept_video': 0,
+                'extra_audio': 0,
                 'skipped': skipped,
                 'segments': len(segments),
                 'gaps': sum(1 for s in segments if s['type'] == 'gap'),
@@ -374,31 +250,11 @@ class VideoProcessor:
         tmp_dir = os.path.join(directory, '_tmp_ffmpeg')
         os.makedirs(tmp_dir, exist_ok=True)
 
-        # Extract audio from dropped webcam files
-        audio_files = []
-        extra_dir = os.path.join(tmp_dir, 'extra_audio')
-        os.makedirs(extra_dir, exist_ok=True)
-        extract_count = 0
-        for track in manifest['audio_tracks']:
-            if track['origin'] == 'webcam_extract':
-                audio_path = os.path.join(extra_dir, f'extra_{extract_count}.m4a')
-                try:
-                    self.ffmpeg.run(
-                        ['ffmpeg', '-y', '-v', 'error',
-                         '-i', track['path'], '-vn',
-                         '-c:a', 'aac', '-b:a', '128k',
-                         '-ar', '44100', '-ac', '2',
-                         audio_path],
-                        description=f'extract audio from webcam {extract_count}',
-                    )
-                    audio_files.append((audio_path, track['start_time']))
-                    extract_count += 1
-                except subprocess.CalledProcessError:
-                    logging.warning(f'Failed to extract audio from {track["path"]}')
-            else:
-                audio_files.append((track['path'], track['start_time']))
-        if extract_count:
-            logging.info(f'Extracted audio from {extract_count} webcam files')
+        # Collect audio-only tracks (webcam audio is mixed inline by grid)
+        audio_files = [
+            AudioTrack(path=t['path'], start_time=t['start_time'], origin=t['origin'])
+            for t in manifest['audio_tracks']
+        ]
 
         # Process segments
         segments = manifest['segments']
@@ -419,13 +275,18 @@ class VideoProcessor:
                 duration = seg['planned_duration']
                 sources = sorted(seg['sources'],
                                  key=lambda s: not s.get('has_audio', False))
-                active = [(s['path'], s['offset']) for s in sources]
+                mix_audio = seg.get('mix_all_audio', False)
+                active = [
+                    GridSource(path=s['path'], offset=s['offset'],
+                               has_audio=s.get('has_audio', True))
+                    for s in sources
+                ]
                 try:
                     if len(active) == 1:
-                        path, offset = active[0]
+                        src = active[0]
                         self.ffmpeg.run(
                             ['ffmpeg', '-y', '-v', 'error',
-                             '-ss', str(offset), '-i', path,
+                             '-ss', str(src.offset), '-i', src.path,
                              '-t', str(duration),
                              '-vf', f'scale={target_w}:{target_h}:'
                                     f'force_original_aspect_ratio=decrease,'
@@ -437,7 +298,9 @@ class VideoProcessor:
                             description=f'grid {i} (1 webcam, {duration:.0f}s)',
                         )
                     else:
-                        self.grid.composite(active, duration, seg_path, target_w, target_h)
+                        self.grid.composite(active, duration, seg_path,
+                                            target_w, target_h,
+                                            mix_all_audio=mix_audio)
                     with_audio = os.path.join(tmp_dir, f'grida_{i}.mp4')
                     final_seg = self.segments.ensure_audio(seg_path, with_audio)
                     concat_segments.append(final_seg)
@@ -450,14 +313,18 @@ class VideoProcessor:
 
             elif seg['type'] == 'video':
                 norm_path = os.path.join(tmp_dir, f'norm_{i}.mp4')
-                self.segments.normalize(seg['source_path'], norm_path,
-                                        target_w, target_h, target_pix_fmt,
-                                        max_duration=seg.get('max_duration', 0))
+                source_offset = seg.get('source_offset', 0)
+                planned_dur = seg.get('planned_duration', 0)
+                self.segments.normalize(
+                    seg['source_path'], norm_path,
+                    target_w, target_h, target_pix_fmt,
+                    max_duration=planned_dur,
+                    seek=source_offset,
+                )
                 with_audio_path = os.path.join(tmp_dir, f'norma_{i}.mp4')
                 final_seg = self.segments.ensure_audio(norm_path, with_audio_path)
 
                 actual_dur = self.prober.get_duration(final_seg)
-                planned_dur = seg.get('planned_duration', 0)
                 if planned_dur > 0 and actual_dur < planned_dur - 1.0:
                     shortfall = planned_dur - actual_dur
                     logging.warning(
@@ -518,11 +385,12 @@ class VideoProcessor:
         return result_path
 
     def process(self, total_duration, downloaded_files, directory,
-                output_path, max_duration=None, slide_events=None):
+                output_path, max_duration=None, slide_events=None,
+                timeline=None):
         """Full pipeline: analyze then execute."""
         manifest = self.analyze(
             total_duration, downloaded_files, directory, output_path,
-            max_duration, slide_events,
+            max_duration, slide_events, timeline=timeline,
         )
         return self.execute(manifest)
 
@@ -530,101 +398,38 @@ class VideoProcessor:
 # --- Backward-compatible module-level functions ---
 
 def process_and_download_clips(directory, json_data):
-    """Parse API JSON for chunks, slides, admin IDs."""
-    segments_builder = SegmentBuilder(FFmpegRunner.__new__(FFmpegRunner), MediaProber())
+    """Parse API JSON for chunks, slides, admin IDs.
+
+    Returns:
+        (total_duration, tagged_chunks, deduped_slides, timeline)
+        where timeline is a StreamTimeline instance built from mediasession events.
+        tagged_chunks are DownloadChunk-compatible tuples for backward compatibility
+        with the download pipeline.
+    """
     total_duration = float(json_data.get('duration', 0))
     if not total_duration:
         raise ValueError('Duration not found in JSON data.')
 
-    admin_conf_ids = segments_builder.extract_admin_conf_ids(json_data)
+    timeline = StreamTimeline()
+    timeline.build(json_data)
 
-    mediasession_adds = {}
-    chunks = []
-    slide_events = []
-    for event in json_data.get('eventLogs', []):
-        if not isinstance(event, dict):
-            continue
-        module = event.get('module', '')
-        data = event.get('data', {})
-        if not isinstance(data, dict):
-            continue
+    # Convert to tuples for backward compatibility with download_chunks_parallel
+    tagged_chunks = [
+        (c.url, c.start_time, c.conf_id, c.is_admin, c.api_duration)
+        for c in timeline.get_download_chunks()
+    ]
 
-        if module == 'mediasession.add' and 'url' in data:
-            ms_id = data.get('id')
-            stream = data.get('stream', {})
-            conf_id = None
-            if isinstance(stream, dict):
-                conf = stream.get('conference', {})
-                if isinstance(conf, dict):
-                    conf_id = conf.get('id')
-            mediasession_adds[ms_id] = {
-                'url': data['url'],
-                'start': event.get('relativeTime', 0),
-                'conf_id': conf_id,
-                'api_duration': 0,
-            }
+    deduped_slides = timeline.get_slide_events_as_dicts()
 
-        if module == 'mediasession.update':
-            ms_id = data.get('id')
-            if ms_id in mediasession_adds:
-                mediasession_adds[ms_id]['api_duration'] = data.get('duration', 0)
-
-        elif 'url' in data and module not in ('mediasession.add',):
-            stream = data.get('stream', {})
-            conf_id = None
-            if isinstance(stream, dict):
-                conf = stream.get('conference', {})
-                if isinstance(conf, dict):
-                    conf_id = conf.get('id')
-            url = data['url']
-            if not any(ms['url'] == url for ms in mediasession_adds.values()):
-                chunks.append((url, event.get('relativeTime', 0), conf_id, 0))
-
-        if module == 'presentation.update':
-            fr = data.get('fileReference', {})
-            if not isinstance(fr, dict):
-                continue
-            slide = fr.get('slide', {})
-            if not isinstance(slide, dict) or not slide.get('url'):
-                continue
-            slide_events.append({
-                'time': event.get('relativeTime', 0),
-                'slide_number': slide.get('number', 0),
-                'slide_url': slide['url'],
-            })
-
-    tagged_chunks = []
-    for ms in mediasession_adds.values():
-        tagged_chunks.append((
-            ms['url'], ms['start'], ms['conf_id'],
-            ms['conf_id'] in admin_conf_ids,
-            ms['api_duration'],
-        ))
-    for url, start, conf_id, api_dur in chunks:
-        tagged_chunks.append((url, start, conf_id, conf_id in admin_conf_ids, api_dur))
-
-    deduped_slides = []
-    for se in slide_events:
-        if not deduped_slides or se['slide_url'] != deduped_slides[-1]['slide_url']:
-            deduped_slides.append(se)
-
-    if deduped_slides:
-        logging.info(f'Found {len(deduped_slides)} presentation slide changes')
-
-    return total_duration, tagged_chunks, deduped_slides
+    return total_duration, tagged_chunks, deduped_slides, timeline
 
 
 def compile_final_video(total_duration, downloaded_files, directory,
-                        output_path, max_duration, slide_events=None):
+                        output_path, max_duration, slide_events=None,
+                        timeline=None):
     """Backward-compatible entry point."""
     processor = VideoProcessor()
     processor.process(total_duration, downloaded_files, directory,
-                      output_path, max_duration, slide_events)
+                      output_path, max_duration, slide_events,
+                      timeline=timeline)
 
-
-# Keep old names for backward compatibility with webinar.py
-def analyze_video(*args, **kwargs):
-    return VideoProcessor().analyze(*args, **kwargs)
-
-def execute_video(manifest):
-    return VideoProcessor().execute(manifest)

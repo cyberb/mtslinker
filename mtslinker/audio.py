@@ -2,10 +2,11 @@ import logging
 import os
 import shutil
 import subprocess
-from typing import List, Tuple
+from typing import List, Union
 
 from mtslinker.ffmpeg import FFmpegRunner
 from mtslinker.prober import MediaProber
+from mtslinker.timeline import AudioTrack
 
 
 class AudioMerger:
@@ -17,25 +18,35 @@ class AudioMerger:
         self.ffmpeg = ffmpeg
         self.prober = prober
 
-    def merge(self, video_path: str, audio_files: List[Tuple[str, float]],
-              tmp_dir: str, output_path: str, total_duration: float = 0) -> str:
+    def merge(self, video_path: str,
+              audio_files: List[Union[AudioTrack, tuple]],
+              tmp_dir: str, output_path: str,
+              total_duration: float = 0) -> str:
         video_duration = total_duration or self.prober.get_duration(video_path)
+
+        # Normalize to AudioTrack objects
+        tracks = []
+        for af in audio_files:
+            if isinstance(af, AudioTrack):
+                tracks.append(af)
+            else:
+                tracks.append(AudioTrack(path=af[0], start_time=af[1]))
 
         # Step 1: Mix in batches with inline adelay
         batch_outputs = []
-        total_batches = (len(audio_files) + self.BATCH_SIZE - 1) // self.BATCH_SIZE
+        total_batches = (len(tracks) + self.BATCH_SIZE - 1) // self.BATCH_SIZE
         for batch_idx, batch_start in enumerate(
-            range(0, len(audio_files), self.BATCH_SIZE)
+            range(0, len(tracks), self.BATCH_SIZE)
         ):
-            batch = audio_files[batch_start:batch_start + self.BATCH_SIZE]
+            batch = tracks[batch_start:batch_start + self.BATCH_SIZE]
             batch_out = os.path.join(tmp_dir, f'audio_batch_{batch_idx}.m4a')
 
             inputs = []
             filter_parts = []
             mix_labels = []
-            for j, (apath, start_time) in enumerate(batch):
-                inputs.extend(['-i', apath])
-                delay_ms = int(start_time * 1000)
+            for j, track in enumerate(batch):
+                inputs.extend(['-i', track.path])
+                delay_ms = int(track.start_time * 1000)
                 label = f'a{j}'
                 filter_parts.append(
                     f'[{j}:a]adelay={delay_ms}|{delay_ms},'
@@ -65,8 +76,8 @@ class AudioMerger:
                         batch_out,
                     ],
                     description=f'amix batch {batch_idx+1} '
-                                f'({len(batch)} tracks, offset {batch[0][1]:.0f}-'
-                                f'{batch[-1][1]:.0f}s)',
+                                f'({len(batch)} tracks, offset {batch[0].start_time:.0f}-'
+                                f'{batch[-1].start_time:.0f}s)',
                 )
                 batch_outputs.append(batch_out)
             except subprocess.CalledProcessError:

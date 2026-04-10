@@ -42,7 +42,3 @@ def test_normalize_with_max_duration(segments, tmp_dir):
     from mtslinker.prober import MediaProber
     dur = MediaProber().get_duration(out)
     assert dur < 3.0
-
-
-def test_deduplicate_empty(segments):
-    assert segments.deduplicate([]) == []
