@@ -1395,7 +1395,13 @@ def analyze_video(
                     'planned_duration': gw['duration'],
                     'sources': gw['sources'],
                 })
-        # No extra audio extraction for grid (audio handled by merge)
+        # Extract audio from ALL video files with audio for mixing
+        # Grid only keeps audio from input 0 — other webcam audio is lost
+        for f in video_files:
+            if f['has_audio']:
+                extra_audio.append(f)
+        if extra_audio:
+            logging.info(f'Grid: {len(extra_audio)} webcam audio tracks to extract')
         # kept_video not used for grid — segments has everything
     else:
         vf_tuples = [(f['path'], f['start_time'], f.get('conf_id'),
