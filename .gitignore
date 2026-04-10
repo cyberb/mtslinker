@@ -4,4 +4,4 @@
 *.mp3
 !mtslinker
 !get_sessionId.mp4
-!setup.py
+!setup.py__pycache__/
