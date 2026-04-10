@@ -180,9 +180,23 @@ class VideoProcessor:
                         'sources': gw['sources'],
                     })
 
-            # Grid composite already includes audio from input 0 (sorted
-            # by has_audio). Don't extract webcam audio — it would echo.
-            # Audio-only tracks cover other participants.
+            # Grid composite includes audio from input 0 (sorted by has_audio).
+            # Extract audio from OTHER webcams (not input 0) to avoid echo
+            # but still capture all voices.
+            grid_input0_paths = set()
+            for seg in segments:
+                if seg['type'] == 'grid' and seg.get('sources'):
+                    # Input 0 = first source sorted by has_audio (same as execute)
+                    sorted_sources = sorted(seg['sources'],
+                                            key=lambda s: not s.get('has_audio', False))
+                    if sorted_sources:
+                        grid_input0_paths.add(sorted_sources[0]['path'])
+
+            for f in video_files:
+                if f['has_audio'] and f['path'] not in grid_input0_paths:
+                    extra_audio.append(f)
+            if extra_audio:
+                logging.info(f'Grid: {len(extra_audio)} non-primary webcam audio to extract')
 
         else:
             vf_tuples = [(f['path'], f['start_time'], f.get('conf_id'),
