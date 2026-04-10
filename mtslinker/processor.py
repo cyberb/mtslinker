@@ -180,12 +180,9 @@ class VideoProcessor:
                         'sources': gw['sources'],
                     })
 
-            # Extract audio from ALL video files with audio for mixing
-            for f in video_files:
-                if f['has_audio']:
-                    extra_audio.append(f)
-            if extra_audio:
-                logging.info(f'Grid: {len(extra_audio)} webcam audio tracks to extract')
+            # Grid composite already includes audio from input 0 (sorted
+            # by has_audio). Don't extract webcam audio — it would echo.
+            # Audio-only tracks cover other participants.
 
         else:
             vf_tuples = [(f['path'], f['start_time'], f.get('conf_id'),
