@@ -22,18 +22,18 @@ def _storage_to_hls_url(storage_url: str) -> str:
     )
 
 
-def _hls_has_video(hls_url: str) -> bool:
-    """Check if an HLS playlist has a video track."""
+def _hls_is_available(hls_url: str) -> bool:
+    """Check if an HLS playlist is reachable and non-empty."""
     try:
         with httpx.Client(timeout=httpx.Timeout(10)) as client:
             r = client.get(hls_url, headers={'User-Agent': 'Mozilla/5.0'})
-            return 'v1/' in r.text
+            return r.status_code == 200 and '#EXTM3U' in r.text
     except Exception:
         return False
 
 
 def download_hls_chunk(hls_url: str, save_path: str) -> str:
-    """Download an HLS stream to mp4 using ffmpeg."""
+    """Download an HLS stream (video, audio, or both) to mp4 using ffmpeg."""
     if not os.path.exists(save_path):
         subprocess.run(
             [
@@ -106,12 +106,19 @@ def download_video_chunk(video_url: str, save_directory: str, max_retries: int =
         os.remove(file_path)
 
     for attempt in range(max_retries + 1):
-        # Check if HLS version has video (storage mp4 may be audio-only)
         hls_url = _storage_to_hls_url(video_url)
-        if _hls_has_video(hls_url):
-            logging.info(f'HLS has video for {filename}, downloading via ffmpeg')
-            download_hls_chunk(hls_url, file_path)
-        else:
+        hls_ok = _hls_is_available(hls_url)
+        if hls_ok:
+            logging.info(f'Downloading via HLS: {filename}')
+            try:
+                download_hls_chunk(hls_url, file_path)
+            except subprocess.CalledProcessError:
+                logging.warning(f'HLS download failed for {filename}, falling back to direct')
+                if os.path.exists(file_path):
+                    os.remove(file_path)
+                hls_ok = False
+        if not hls_ok:
+            logging.info(f'Downloading direct: {filename}')
             with open(file_path, 'wb') as file:
                 with httpx.Client(timeout=TIMEOUT_SETTINGS) as client:
                     with client.stream('GET', video_url) as response:
