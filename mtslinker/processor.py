@@ -225,7 +225,7 @@ class VideoProcessor:
         logging.info(f'Plan: {manifest["stats"]["segments"]} segments '
                      f'({manifest["stats"]["gaps"]} gaps), '
                      f'{len(all_audio)} audio tracks, '
-                     f'strategy={overlap_strategy}')
+                     f'strategy=timeline')
 
         if errors:
             for e in errors:
