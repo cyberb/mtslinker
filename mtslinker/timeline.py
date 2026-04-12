@@ -49,6 +49,7 @@ class GridSource:
     path: str
     offset: float
     has_audio: bool = True
+    is_admin: bool = False
 
 
 @dataclass

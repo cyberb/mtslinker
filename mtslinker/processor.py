@@ -98,11 +98,14 @@ class VideoProcessor:
                     continue
                 offset = max(0, tw.start_time - stream.start_time)
                 f = path_lookup[stream.file_path]
+                is_admin = stream.conf_id in timeline.admin_conf_ids
                 sources.append({
                     'path': stream.file_path,
                     'offset': offset,
                     'remaining': tw.duration,
                     'has_audio': stream.has_audio and f['has_audio'],
+                    'is_admin': is_admin,
+                    'is_screenshare': bool(stream.has_video and not stream.has_audio),
                 })
             if not sources:
                 segments.append({
@@ -125,13 +128,43 @@ class VideoProcessor:
                     'height': f['height'],
                 })
             else:
-                segments.append({
-                    'type': 'grid',
-                    'start_time': tw.start_time,
-                    'planned_duration': tw.duration,
-                    'sources': sources,
-                    'mix_all_audio': True,
-                })
+                # Presenter layout: admin/screenshare as main, others as PIP
+                screenshares = [s for s in sources if s.get('is_screenshare')]
+                admins = [s for s in sources if s.get('is_admin') and not s.get('is_screenshare')]
+                others = [s for s in sources if not s.get('is_admin') and not s.get('is_screenshare')]
+
+                main_source = None
+                overlay_source = None
+                if screenshares:
+                    main_source = screenshares[0]
+                    overlay_source = admins[0] if admins else (others[0] if others else None)
+                elif admins:
+                    main_source = admins[0]
+                    overlay_source = others[0] if others else None
+
+                if main_source:
+                    used = {id(main_source)}
+                    if overlay_source:
+                        used.add(id(overlay_source))
+                    extra_audio = [s for s in sources if id(s) not in used and s.get('has_audio')]
+                    segments.append({
+                        'type': 'presenter',
+                        'start_time': tw.start_time,
+                        'planned_duration': tw.duration,
+                        'main_source': main_source,
+                        'overlay_source': overlay_source,
+                        'extra_audio_sources': extra_audio,
+                        'mix_all_audio': True,
+                    })
+                else:
+                    # No admin, no screenshare — fall back to grid
+                    segments.append({
+                        'type': 'grid',
+                        'start_time': tw.start_time,
+                        'planned_duration': tw.duration,
+                        'sources': sources,
+                        'mix_all_audio': True,
+                    })
 
         # Fill leading/trailing gaps
         filled = []
@@ -307,6 +340,41 @@ class VideoProcessor:
                 except subprocess.CalledProcessError:
                     logging.warning(f'Grid segment {i} failed, using black gap')
                     gap_path = os.path.join(tmp_dir, f'gridfail_{i}.mp4')
+                    self.segments.generate_black(gap_path, duration,
+                                                 target_w, target_h, target_pix_fmt)
+                    concat_segments.append(gap_path)
+
+            elif seg['type'] == 'presenter':
+                os.makedirs(grid_dir, exist_ok=True)
+                seg_path = os.path.join(grid_dir, f'presenter_{i}.mp4')
+                duration = seg['planned_duration']
+                ms = seg['main_source']
+                main = GridSource(path=ms['path'], offset=ms['offset'],
+                                  has_audio=ms.get('has_audio', True),
+                                  is_admin=ms.get('is_admin', False))
+                overlay = None
+                if seg.get('overlay_source'):
+                    os_ = seg['overlay_source']
+                    overlay = GridSource(path=os_['path'], offset=os_['offset'],
+                                        has_audio=os_.get('has_audio', True),
+                                        is_admin=os_.get('is_admin', False))
+                extra = [
+                    GridSource(path=s['path'], offset=s['offset'],
+                               has_audio=s.get('has_audio', True))
+                    for s in seg.get('extra_audio_sources', [])
+                ]
+                try:
+                    self.grid.presenter_composite(
+                        main, overlay, extra, duration, seg_path,
+                        target_w, target_h,
+                        mix_all_audio=seg.get('mix_all_audio', True),
+                    )
+                    with_audio = os.path.join(tmp_dir, f'presenta_{i}.mp4')
+                    final_seg = self.segments.ensure_audio(seg_path, with_audio)
+                    concat_segments.append(final_seg)
+                except subprocess.CalledProcessError:
+                    logging.warning(f'Presenter segment {i} failed, using black gap')
+                    gap_path = os.path.join(tmp_dir, f'presfail_{i}.mp4')
                     self.segments.generate_black(gap_path, duration,
                                                  target_w, target_h, target_pix_fmt)
                     concat_segments.append(gap_path)

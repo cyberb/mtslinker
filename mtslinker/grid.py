@@ -1,5 +1,5 @@
 import math
-from typing import List, Union
+from typing import List, Optional, Union
 
 from mtslinker.ffmpeg import FFmpegRunner
 from mtslinker.timeline import GridSource
@@ -79,7 +79,9 @@ class GridCompositor:
             filter_graph += ';'
         filter_graph += (
             ''.join(labels)
-            + f'xstack=inputs={total_cells}:layout={layout}[out]'
+            + f'xstack=inputs={total_cells}:layout={layout}[stacked]'
+            + f';[stacked]scale={target_w}:{target_h}:force_original_aspect_ratio=decrease,'
+            + f'pad={target_w}:{target_h}:(ow-iw)/2:(oh-ih)/2:black,setsar=1[out]'
         )
 
         # Audio mixing
@@ -119,4 +121,95 @@ class GridCompositor:
             output_path,
         ]
         self.ffmpeg.run(cmd, description=f'grid {n} webcams, {duration:.0f}s')
+        return output_path
+
+    def presenter_composite(self, main: GridSource,
+                            overlay: Optional[GridSource],
+                            extra_audio: List[GridSource],
+                            duration: float, output_path: str,
+                            target_w: int, target_h: int,
+                            mix_all_audio: bool = True) -> str:
+        """Composite presenter layout: main full-screen, overlay PIP top-right.
+
+        Output is always exactly target_w x target_h.
+        """
+        pip_w = self.even(target_w // 4)
+        pip_h = self.even(target_h // 4)
+        margin = 16
+
+        inputs = ['-ss', str(main.offset), '-i', main.path]
+        all_sources = [main]
+
+        if overlay:
+            inputs.extend(['-ss', str(overlay.offset), '-i', overlay.path])
+            all_sources.append(overlay)
+
+        for src in extra_audio:
+            inputs.extend(['-ss', str(src.offset), '-i', src.path])
+            all_sources.append(src)
+
+        # Video filter
+        vfilter = (
+            f'[0:v]scale={target_w}:{target_h}:'
+            f'force_original_aspect_ratio=decrease,'
+            f'pad={target_w}:{target_h}:(ow-iw)/2:(oh-ih)/2:black,setsar=1[main]'
+        )
+
+        if overlay:
+            vfilter += (
+                f';[1:v]scale={pip_w}:{pip_h}:'
+                f'force_original_aspect_ratio=decrease,'
+                f'pad={pip_w}:{pip_h}:(ow-iw)/2:(oh-ih)/2:black,setsar=1[pip]'
+                f';[main][pip]overlay=x={target_w - pip_w - margin}:y={margin}[out]'
+            )
+        else:
+            vfilter += ';[main]copy[out]'
+
+        # Audio filter — mix all sources that have audio
+        audio_labels = []
+        afilter = ''
+        for i, src in enumerate(all_sources):
+            if not src.has_audio:
+                continue
+            alabel = f'a{i}'
+            afilter += (
+                f';[{i}:a]apad=whole_dur={duration},'
+                f'atrim=0:{duration}[{alabel}]'
+            )
+            audio_labels.append(f'[{alabel}]')
+
+        if len(audio_labels) > 1:
+            afilter += (
+                ';' + ''.join(audio_labels)
+                + f'amix=inputs={len(audio_labels)}:duration=longest:normalize=0[aout]'
+            )
+            audio_map = ['-map', '[aout]']
+        elif len(audio_labels) == 1:
+            # Single audio, keep the label and map it
+            afilter += f';{audio_labels[0]}acopy[aout]'
+            audio_map = ['-map', '[aout]']
+        else:
+            afilter = ''
+            audio_map = []
+
+        filter_graph = vfilter + afilter
+
+        cmd = [
+            'ffmpeg', '-y', '-v', 'error',
+            *inputs,
+            '-t', str(duration),
+            '-filter_complex', filter_graph,
+            '-map', '[out]', *audio_map,
+            *self.ffmpeg.get_video_encoder_fast(),
+            '-pix_fmt', 'yuv420p',
+            '-c:a', 'aac', '-b:a', '128k', '-ar', '44100', '-ac', '2',
+            '-r', '25',
+            output_path,
+        ]
+        desc = 'presenter'
+        if overlay:
+            desc += ' + PIP'
+        if extra_audio:
+            desc += f' + {len(extra_audio)} audio'
+        self.ffmpeg.run(cmd, description=f'{desc}, {duration:.0f}s')
         return output_path
