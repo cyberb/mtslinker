@@ -145,18 +145,31 @@ class AudioMerger:
 
         # Step 3: Overlay mixed audio onto video
         logging.info('Overlaying mixed audio onto video...')
-        self.ffmpeg.run(
-            [
-                'ffmpeg', '-y', '-v', 'warning',
-                '-i', video_path,
-                '-i', mixed_audio_path,
-                '-filter_complex',
-                '[0:a][1:a]amix=inputs=2:duration=first:normalize=0[aout]',
-                '-map', '0:v', '-map', '[aout]',
-                '-c:v', 'copy',
-                '-c:a', 'aac', '-b:a', '192k',
-                output_path,
-            ],
-            description='overlay mixed audio onto video',
-        )
+        video_has_audio = self.prober.has_audio(video_path)
+        if video_has_audio:
+            # Mix video's audio with merged audio, normalize sample rates
+            filter_graph = (
+                '[0:a]aresample=44100[va];'
+                '[va][1:a]amix=inputs=2:duration=first:normalize=0[aout]'
+            )
+            audio_map = ['-map', '[aout]']
+        else:
+            # Video has no audio, just use merged audio
+            audio_map = ['-map', '1:a']
+            filter_graph = None
+
+        cmd = [
+            'ffmpeg', '-y', '-v', 'warning',
+            '-i', video_path,
+            '-i', mixed_audio_path,
+        ]
+        if filter_graph:
+            cmd.extend(['-filter_complex', filter_graph])
+        cmd.extend([
+            '-map', '0:v', *audio_map,
+            '-c:v', 'copy',
+            '-c:a', 'aac', '-b:a', '192k',
+            output_path,
+        ])
+        self.ffmpeg.run(cmd, description='overlay mixed audio onto video')
         return output_path
