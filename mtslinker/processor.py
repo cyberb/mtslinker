@@ -105,7 +105,7 @@ class VideoProcessor:
                     'remaining': tw.duration,
                     'has_audio': stream.has_audio and f['has_audio'],
                     'is_admin': is_admin,
-                    'is_screenshare': bool(stream.has_video and not stream.has_audio),
+                    'is_screenshare': stream.is_screenshare,
                 })
             if not sources:
                 segments.append({

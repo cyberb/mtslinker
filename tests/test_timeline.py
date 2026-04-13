@@ -5,10 +5,15 @@ def _make_json(events, duration=100.0):
     return {'duration': duration, 'eventLogs': events}
 
 
-def _ms_add(ms_id, url, time, conf_id=None):
+def _ms_add(ms_id, url, time, conf_id=None, screenshare_id=None):
     data = {'id': ms_id, 'url': url}
+    stream = {}
     if conf_id:
-        data['stream'] = {'conference': {'id': conf_id}}
+        stream['conference'] = {'id': conf_id}
+    if screenshare_id:
+        stream['screensharing'] = {'id': screenshare_id}
+    if stream:
+        data['stream'] = stream
     return {'module': 'mediasession.add', 'relativeTime': time, 'data': data}
 
 
@@ -174,6 +179,31 @@ def test_fallback_url_capture():
     windows = tl.build(json_data)
     assert len(tl.sessions) == 1
     assert any('fallback' in sid for sid in tl.sessions)
+
+
+def test_screenshare_detection():
+    """mediasession with stream.screensharing should be flagged."""
+    json_data = _make_json([
+        _ms_add('ms1', 'http://webcam.mp4', 0.0, conf_id='c1'),
+        _ms_update('ms1', 50.0),
+        _ms_add('ms2', 'http://screen.mp4', 10.0, screenshare_id=99),
+        _ms_update('ms2', 40.0),
+    ], duration=50.0)
+    tl = StreamTimeline()
+    tl.build(json_data)
+    assert tl.sessions['ms1'].is_screenshare is False
+    assert tl.sessions['ms2'].is_screenshare is True
+
+
+def test_screenshare_not_detected_without_id():
+    """Empty screensharing dict should not flag as screenshare."""
+    json_data = _make_json([
+        _ms_add('ms1', 'http://a.mp4', 0.0),
+        _ms_update('ms1', 50.0),
+    ], duration=50.0)
+    tl = StreamTimeline()
+    tl.build(json_data)
+    assert tl.sessions['ms1'].is_screenshare is False
 
 
 def test_time_window_properties():

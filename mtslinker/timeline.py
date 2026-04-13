@@ -19,6 +19,7 @@ class MediaSession:
     conf_id: Optional[str] = None
     has_audio: bool = True
     has_video: bool = True
+    is_screenshare: bool = False
     user_id: Optional[str] = None
     file_path: Optional[str] = None  # set after download
 
@@ -195,11 +196,15 @@ class StreamTimeline:
                 if not ms_id:
                     continue
                 conf_id = None
+                is_screenshare = False
                 stream = data.get('stream', {})
                 if isinstance(stream, dict):
                     conf = stream.get('conference', {})
                     if isinstance(conf, dict):
                         conf_id = conf.get('id')
+                    ss = stream.get('screensharing', {})
+                    if isinstance(ss, dict) and ss.get('id'):
+                        is_screenshare = True
 
                 props = conf_props.get(conf_id, {})
                 self.sessions[ms_id] = MediaSession(
@@ -209,6 +214,7 @@ class StreamTimeline:
                     conf_id=conf_id,
                     has_audio=props.get('has_audio', True),
                     has_video=props.get('has_video', True),
+                    is_screenshare=is_screenshare,
                     user_id=conf_users.get(conf_id),
                 )
 
