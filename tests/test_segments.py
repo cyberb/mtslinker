@@ -18,12 +18,18 @@ def test_ensure_audio_keeps_existing(segments, tmp_dir):
 
 
 def test_ensure_audio_adds_silent(segments, tmp_dir):
+    from mtslinker.prober import MediaProber
     vid = os.path.join(tmp_dir, 'without.mp4')
     out = os.path.join(tmp_dir, 'out.mp4')
-    make_test_video(vid, with_audio=False)
+    make_test_video(vid, with_audio=False, duration=5)
     result = segments.ensure_audio(vid, out)
     assert result == out
     assert os.path.exists(out)
+    prober = MediaProber()
+    # Silent audio stream must actually be present...
+    assert prober.has_audio(out)
+    # ...and the -t bound must not truncate the video.
+    assert abs(prober.get_duration(out) - prober.get_duration(vid)) < 0.5
 
 
 def test_normalize(segments, tmp_dir):

@@ -37,11 +37,18 @@ class SegmentBuilder:
         )
         if has_audio:
             return input_path
+        # anullsrc is an infinite source; with -c:v copy the video is muxed
+        # faster than realtime, so -shortest alone lets the interleaving
+        # buffer grow until ffmpeg dies with "Cannot allocate memory".
+        # Bound the silent audio to the measured video duration.
+        duration = self.prober.get_duration(input_path)
+        bound = ['-t', str(duration)] if duration > 0 else []
         self.ffmpeg.run(
             [
                 'ffmpeg', '-y', '-v', 'error',
                 '-i', input_path,
                 '-f', 'lavfi', '-i', 'anullsrc=r=44100:cl=stereo',
+                *bound,
                 '-c:v', 'copy', '-c:a', 'aac', '-b:a', '128k',
                 '-shortest',
                 output_path,
