@@ -1,5 +1,71 @@
 import os
 from tests.conftest import make_test_video
+from mtslinker.segments import SegmentBuilder
+
+
+class _SpyFFmpeg:
+    """Captures the last ffmpeg command instead of running it."""
+
+    def __init__(self):
+        self.cmd = None
+
+    def run(self, cmd, description='ffmpeg'):
+        self.cmd = cmd
+
+
+class _FakeProber:
+    """No audio in input, fixed duration — exercises the silent-audio path."""
+
+    def __init__(self, duration):
+        self._duration = duration
+
+    def probe_streams(self, path):
+        return {'streams': [{'codec_type': 'video'}]}
+
+    def get_duration(self, path):
+        return self._duration
+
+
+def _flag_index(cmd, flag):
+    return cmd.index(flag)
+
+
+def test_ensure_audio_guards_against_interleave_oom():
+    """The silent-audio mux must not OOM via the muxer interleave buffer.
+
+    Regression guard for av_interleaved_write_frame "Cannot allocate
+    memory": with -c:v copy + a lazily-generated anullsrc, ffmpeg buffers
+    the whole copied video in RAM unless we (a) cap the interleave buffer
+    and (b) make the silent input finite. A small test clip never triggers
+    the real OOM, so we assert the *command* keeps both safeguards.
+    """
+    spy = _SpyFFmpeg()
+    builder = SegmentBuilder(spy, _FakeProber(duration=1234.0))
+    builder.ensure_audio('in.mp4', 'out.mp4')
+    cmd = spy.cmd
+
+    # (a) muxer must not buffer to interleave
+    assert '-max_interleave_delta' in cmd
+    assert cmd[cmd.index('-max_interleave_delta') + 1] == '0'
+
+    # (b) anullsrc must be a finite input: -t before its -i, not after
+    anull = cmd.index('anullsrc=r=44100:cl=stereo')
+    t_idx = cmd.index('-t')
+    assert t_idx < anull, '-t must bound the anullsrc *input*, not the output'
+    assert cmd[t_idx + 1] == '1234.0'
+
+    # correctness not regressed: video still stream-copied
+    assert cmd[cmd.index('-c:v') + 1] == 'copy'
+
+
+def test_ensure_audio_safe_when_duration_unknown():
+    """Probe miss (duration 0) must still cap the interleave buffer."""
+    spy = _SpyFFmpeg()
+    builder = SegmentBuilder(spy, _FakeProber(duration=0.0))
+    builder.ensure_audio('in.mp4', 'out.mp4')
+    cmd = spy.cmd
+    assert '-max_interleave_delta' in cmd
+    assert cmd[cmd.index('-max_interleave_delta') + 1] == '0'
 
 
 def test_generate_black(segments, tmp_dir):

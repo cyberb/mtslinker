@@ -37,20 +37,26 @@ class SegmentBuilder:
         )
         if has_audio:
             return input_path
-        # anullsrc is an infinite source; with -c:v copy the video is muxed
-        # faster than realtime, so -shortest alone lets the interleaving
-        # buffer grow until ffmpeg dies with "Cannot allocate memory".
-        # Bound the silent audio to the measured video duration.
+        # With -c:v copy the muxer gets every video packet almost instantly,
+        # while anullsrc audio is produced lazily. To interleave correctly the
+        # muxer buffers the copied video in RAM waiting for audio, which on a
+        # long segment grows until "av_interleaved_write_frame: Cannot allocate
+        # memory". -max_interleave_delta 0 makes it write packets immediately
+        # instead of buffering to interleave. We also bound the anullsrc input
+        # itself to the measured duration so it is finite, not infinite.
         duration = self.prober.get_duration(input_path)
-        bound = ['-t', str(duration)] if duration > 0 else []
+        silent_in = (
+            ['-f', 'lavfi', '-t', str(duration), '-i', 'anullsrc=r=44100:cl=stereo']
+            if duration > 0
+            else ['-f', 'lavfi', '-i', 'anullsrc=r=44100:cl=stereo']
+        )
         self.ffmpeg.run(
             [
                 'ffmpeg', '-y', '-v', 'error',
                 '-i', input_path,
-                '-f', 'lavfi', '-i', 'anullsrc=r=44100:cl=stereo',
-                *bound,
+                *silent_in,
                 '-c:v', 'copy', '-c:a', 'aac', '-b:a', '128k',
-                '-shortest',
+                '-shortest', '-max_interleave_delta', '0',
                 output_path,
             ],
             description='add silent audio stream',
