@@ -383,14 +383,26 @@ class VideoProcessor:
                 norm_path = os.path.join(tmp_dir, f'norm_{i}.mp4')
                 source_offset = seg.get('source_offset', 0)
                 planned_dur = seg.get('planned_duration', 0)
-                self.segments.normalize(
-                    seg['source_path'], norm_path,
-                    target_w, target_h, target_pix_fmt,
-                    max_duration=planned_dur,
-                    seek=source_offset,
-                )
-                with_audio_path = os.path.join(tmp_dir, f'norma_{i}.mp4')
-                final_seg = self.segments.ensure_audio(norm_path, with_audio_path)
+                try:
+                    self.segments.normalize(
+                        seg['source_path'], norm_path,
+                        target_w, target_h, target_pix_fmt,
+                        max_duration=planned_dur,
+                        seek=source_offset,
+                    )
+                    with_audio_path = os.path.join(tmp_dir, f'norma_{i}.mp4')
+                    final_seg = self.segments.ensure_audio(
+                        norm_path, with_audio_path)
+                except subprocess.CalledProcessError:
+                    logging.warning(
+                        f'Video segment {i} failed, using black gap')
+                    gap_dur = planned_dur or seg.get('source_duration', 0)
+                    gap_path = os.path.join(tmp_dir, f'vidfail_{i}.mp4')
+                    self.segments.generate_black(gap_path, gap_dur,
+                                                 target_w, target_h,
+                                                 target_pix_fmt)
+                    concat_segments.append(gap_path)
+                    continue
 
                 actual_dur = self.prober.get_duration(final_seg)
                 if planned_dur > 0 and actual_dur < planned_dur - 1.0:

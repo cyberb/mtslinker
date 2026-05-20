@@ -1,4 +1,8 @@
 import os
+import subprocess
+
+import pytest
+
 from tests.conftest import make_test_video
 from mtslinker.segments import SegmentBuilder
 
@@ -11,6 +15,9 @@ class _SpyFFmpeg:
 
     def run(self, cmd, description='ffmpeg'):
         self.cmd = cmd
+
+    def get_video_encoder_fast(self):
+        return ['-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '23']
 
 
 class _FakeProber:
@@ -58,14 +65,49 @@ def test_ensure_audio_guards_against_interleave_oom():
     assert cmd[cmd.index('-c:v') + 1] == 'copy'
 
 
-def test_ensure_audio_safe_when_duration_unknown():
-    """Probe miss (duration 0) must still cap the interleave buffer."""
+def test_ensure_audio_rejects_zero_duration_input():
+    """Empty/corrupt input (duration <= 0) must fail loudly, not run ffmpeg.
+
+    Root cause of the production OOM: normalize() seeked past end-of-source
+    and produced a 262-byte, duration-0 file; feeding it to ensure_audio ran
+    an unbounded anullsrc + -c:v copy mux that buffered silent audio forever
+    until "av_interleaved_write_frame: Cannot allocate memory". ensure_audio
+    must refuse a non-positive-duration input (raising the same
+    CalledProcessError the callers' black-gap fallback catches) and must
+    never invoke ffmpeg in that case.
+    """
     spy = _SpyFFmpeg()
     builder = SegmentBuilder(spy, _FakeProber(duration=0.0))
-    builder.ensure_audio('in.mp4', 'out.mp4')
-    cmd = spy.cmd
-    assert '-max_interleave_delta' in cmd
-    assert cmd[cmd.index('-max_interleave_delta') + 1] == '0'
+    with pytest.raises(subprocess.CalledProcessError):
+        builder.ensure_audio('in.mp4', 'out.mp4')
+    assert spy.cmd is None, 'ffmpeg must not run on a zero-duration input'
+
+
+def test_normalize_fails_loudly_on_empty_output():
+    """Seek past end-of-source: ffmpeg exits 0 with an empty container.
+
+    normalize() must detect the zero-duration output and raise
+    CalledProcessError so the processor falls back to a black gap instead
+    of handing an empty file to ensure_audio (the OOM trigger).
+    """
+    spy = _SpyFFmpeg()
+    builder = SegmentBuilder(spy, _FakeProber(duration=0.0))
+    with pytest.raises(subprocess.CalledProcessError):
+        builder.normalize('in.mp4', 'out.mp4', 640, 360, 'yuv420p',
+                          max_duration=90.0, seek=104.0)
+    # ffmpeg *was* attempted (the emptiness is only knowable post-run)...
+    assert spy.cmd is not None
+    # ...and it really was the normalize seek that ran.
+    assert spy.cmd[spy.cmd.index('-ss') + 1] == '104.0'
+
+
+def test_normalize_succeeds_when_output_nonempty():
+    """A normal (non-empty) normalize must still return the output path."""
+    spy = _SpyFFmpeg()
+    builder = SegmentBuilder(spy, _FakeProber(duration=90.0))
+    result = builder.normalize('in.mp4', 'out.mp4', 640, 360, 'yuv420p',
+                               max_duration=90.0)
+    assert result == 'out.mp4'
 
 
 def test_generate_black(segments, tmp_dir):

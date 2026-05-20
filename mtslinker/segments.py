@@ -1,4 +1,5 @@
 import os
+import subprocess
 
 from mtslinker.ffmpeg import FFmpegRunner
 from mtslinker.prober import MediaProber
@@ -37,24 +38,28 @@ class SegmentBuilder:
         )
         if has_audio:
             return input_path
-        # With -c:v copy the muxer gets every video packet almost instantly,
-        # while anullsrc audio is produced lazily. To interleave correctly the
-        # muxer buffers the copied video in RAM waiting for audio, which on a
-        # long segment grows until "av_interleaved_write_frame: Cannot allocate
-        # memory". -max_interleave_delta 0 makes it write packets immediately
-        # instead of buffering to interleave. We also bound the anullsrc input
-        # itself to the measured duration so it is finite, not infinite.
+        # anullsrc MUST be bounded by an input-side -t equal to the video
+        # length. With an unbounded anullsrc and -c:v copy, if the input has
+        # no decodable video the muxer waits forever for a video packet to
+        # interleave against, buffering silent audio without bound until
+        # "av_interleaved_write_frame: Cannot allocate memory" (observed in
+        # production on a normalize() output that seeked past end-of-source).
+        # A zero/unknown duration means the input is empty or corrupt, so
+        # there is no safe silent track to synthesize: fail loudly (the
+        # callers fall back to a black gap) instead of running unbounded.
         duration = self.prober.get_duration(input_path)
-        silent_in = (
-            ['-f', 'lavfi', '-t', str(duration), '-i', 'anullsrc=r=44100:cl=stereo']
-            if duration > 0
-            else ['-f', 'lavfi', '-i', 'anullsrc=r=44100:cl=stereo']
-        )
+        if duration <= 0:
+            raise subprocess.CalledProcessError(
+                1, 'ensure_audio', output=None,
+                stderr=(f'refusing silent-audio mux: {input_path} has no '
+                        f'positive duration (empty or corrupt input)'),
+            )
         self.ffmpeg.run(
             [
                 'ffmpeg', '-y', '-v', 'error',
                 '-i', input_path,
-                *silent_in,
+                '-f', 'lavfi', '-t', str(duration),
+                '-i', 'anullsrc=r=44100:cl=stereo',
                 '-c:v', 'copy', '-c:a', 'aac', '-b:a', '128k',
                 '-shortest', '-max_interleave_delta', '0',
                 output_path,
@@ -84,6 +89,17 @@ class SegmentBuilder:
             ],
             description=f'normalize segment {os.path.basename(input_path)}',
         )
+        # ffmpeg exits 0 even when -ss seeks past end-of-source and zero
+        # frames are decoded, leaving a tiny but valid empty container.
+        # Treat a zero-duration normalize as a failure so the caller falls
+        # back to a black gap instead of feeding an empty file into
+        # ensure_audio (whose muxer would then OOM).
+        if self.prober.get_duration(output_path) <= 0:
+            raise subprocess.CalledProcessError(
+                1, 'normalize', output=None,
+                stderr=(f'normalize produced empty output for {input_path} '
+                        f'(seek {seek}s past end-of-source?)'),
+            )
         return output_path
 
 
