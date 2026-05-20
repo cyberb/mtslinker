@@ -3,3 +3,5 @@
 *.mp3
 !get_sessionId.mp4
 __pycache__/
+*.pyc
+*.egg-info/
