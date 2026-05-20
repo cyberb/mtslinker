@@ -66,6 +66,13 @@ class FFmpegRunner:
             return ['-c:v', 'h264_nvenc', '-preset', 'p1', '-cq', '28']
         return ['-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '23']
 
+    def get_video_encoder_cpu(self) -> list:
+        # Fallback for callers that need to bypass NVENC after a system
+        # OOM-kill — NVENC's pinned host buffers can push long filter_complex
+        # jobs over the memory budget; libx264 fits in less RAM at the cost
+        # of CPU time.
+        return ['-c:v', 'libx264', '-preset', 'fast', '-crf', '23']
+
     def run(self, cmd: list, description: str = 'ffmpeg'):
         logging.debug(f'Running {description}: {" ".join(cmd[:6])}...')
         result = subprocess.run(cmd, capture_output=True, text=True)
